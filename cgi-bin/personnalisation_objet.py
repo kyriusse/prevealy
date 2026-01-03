@@ -1,604 +1,700 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# Script CGI execute par le serveur web
+# Encodage UTF-8 pour accepter les accents
 
-import os
-import sqlite3
-import urllib.parse
-import difflib
-import html
+import os  # Acces aux variables d'environnement et chemins
+import sqlite3  # Acces a la base SQLite
+import urllib.parse  # Lecture / encodage des parametres URL
+import difflib  # Recherche floue (similarite entre chaines)
+import html  # Echappement HTML (anti-injection)
 
-print("Content-Type: text/html; charset=utf-8\n")
+print("Content-Type: text/html; charset=utf-8\n")  # En-tete HTTP obligatoire pour un CGI
 
-UNIVERSE_DIR = "cgi-bin/universes/"
-
-# ---------------------------
-# Utils
-# ---------------------------
-def get_param(name, default=""):
-    qs = os.environ.get("QUERY_STRING", "")
-    params = urllib.parse.parse_qs(qs, keep_blank_values=True)
-    return params.get(name, [default])[0]
-
-def universe_path(universe_id):
-    safe = "".join([c for c in universe_id if c.isalnum() or c in ("-", "_")])
-    return os.path.join(UNIVERSE_DIR, f"universe_{safe}.db")
-
-def esc(s):
-    return html.escape("" if s is None else str(s))
-
-def ensure_column(db_path, table, col_name, col_def_sql):
-    conn = None
-    try:
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        cur.execute(f"PRAGMA table_info({table})")
-        cols = [r[1] for r in cur.fetchall()]
-        if col_name not in cols:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def_sql}")
-            conn.commit()
-        return True
-    except Exception:
-        return False
-    finally:
-        if conn is not None:
-            conn.close()
-
-def ensure_id_stat_filled(db_path):
-    """
-    Ensure id_stat exists and is filled for older rows.
-    We use rowid to populate missing id_stat values.
-    """
-    conn = None
-    try:
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-
-        cur.execute("PRAGMA table_info(stat_objects)")
-        cols = [r[1] for r in cur.fetchall()]
-        if "id_stat" not in cols:
-            cur.execute("ALTER TABLE stat_objects ADD COLUMN id_stat INTEGER")
-            conn.commit()
-
-        # fill missing id_stat using rowid
-        cur.execute("UPDATE stat_objects SET id_stat = rowid WHERE id_stat IS NULL")
-        conn.commit()
-        return True
-    except Exception:
-        return False
-    finally:
-        if conn is not None:
-            conn.close()
-
-def get_columns(db_path):
-    conn = None
-    try:
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        cur.execute("PRAGMA table_info(stat_objects)")
-        cols = [r[1] for r in cur.fetchall()]
-        return cols
-    except Exception:
-        return []
-    finally:
-        if conn is not None:
-            conn.close()
-
-def find_name_col(columns):
-    for c in columns:
-        cl = c.lower()
-        if ("objet" in cl) or ("nom" in cl) or ("name" in cl) or ("designation" in cl):
-            return c
-    return columns[1] if len(columns) > 1 else (columns[0] if columns else None)
-
-def find_type_col(columns):
-    for c in columns:
-        if c.lower() in ("type", "types"):
-            return c
-    for c in columns:
-        if "type" in c.lower():
-            return c
-    return None
-
-def find_family_col(columns):
-    for c in columns:
-        if "famil" in c.lower():
-            return c
-    return None
-
-def find_price_col(columns):
-    for c in columns:
-        cl = c.lower()
-        if ("prix" in cl) or ("price" in cl):
-            return c
-    return None
+UNIVERSE_DIR = "cgi-bin/universes/"  # Dossier contenant les BDD des univers
 
 # ---------------------------
-# Search (now includes EVERYTHING, including created objects and linked ones)
-# We use rowid as the selection key (reliable).
+# Utils (parametres / securite / BDD)
 # ---------------------------
-def search_objects(db_path, search_term):
-    try:
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
 
-        cols = get_columns(db_path)
-        if not cols:
-            conn.close()
-            return []
+def lire_parametre_get(name, default=""):  # Fonction: lire un parametre GET dans l'URL
+    qs = os.environ.get("QUERY_STRING", "")  # Recupere la query string brute
+    params = urllib.parse.parse_qs(qs, keep_blank_values=True)  # Parse les parametres ?a=...&b=...
+    return params.get(name, [default])[0]  # Renvoie la premiere valeur ou le defaut
 
-        name_col = find_name_col(cols)
-        if not name_col:
-            conn.close()
-            return []
+def chemin_univers(universe_id):  # Fonction: construit le chemin du fichier .db d'un univers
+    safe = "".join([c for c in universe_id if c.isalnum() or c in ("-", "_")])  # Nettoie l'ID (anti-chemin)
+    return os.path.join(UNIVERSE_DIR, f"universe_{safe}.db")  # Chemin final vers la BDD
 
-        # Include all rows (no liaison filter)
-        cur.execute(f"SELECT rowid, [{name_col}] FROM stat_objects")
-        all_objects = cur.fetchall()
-        conn.close()
+def echapper_html(s):  # Fonction: echappe une valeur pour l'afficher en HTML sans risque
+    return html.escape("" if s is None else str(s))  # Transforme en string + escape HTML
 
-        if not search_term or len(search_term.strip()) < 2:
-            return []
+def assurer_colonne(db_path, table, col_name, col_def_sql):  # Fonction: s'assure qu'une colonne existe
+    conn = None  # Variable connexion (pour fermer proprement)
+    try:  # Bloc protegeant contre les erreurs
+        conn = sqlite3.connect(db_path)  # Ouvre la connexion SQLite
+        cur = conn.cursor()  # Cree un curseur
+        cur.execute(f"PRAGMA table_info({table})")  # Liste les colonnes de la table
+        cols = [r[1] for r in cur.fetchall()]  # Extrait les noms de colonnes
+        if col_name not in cols:  # Si la colonne n'existe pas
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def_sql}")  # Ajoute la colonne
+            conn.commit()  # Valide la modification
+        return True  # Ok
+    except Exception:  # Si erreur (table inexistante, fichier manquant, etc.)
+        return False  # Echec
+    finally:  # Toujours execute
+        if conn is not None:  # Si connexion ouverte
+            conn.close()  # Ferme la connexion
 
-        st = search_term.lower().strip()
-        matches = []
-        for rid, oname in all_objects:
-            if oname is None:
-                continue
-            ratio = difflib.SequenceMatcher(None, st, str(oname).lower()).ratio()
-            if ratio > 0.3:
-                matches.append((rid, oname, ratio))
+def assurer_id_stat_rempli(db_path):  # Fonction: garantit id_stat existe et est rempli pour les anciennes lignes
+    conn = None  # Variable connexion
+    try:  # Bloc protegeant contre les erreurs
+        conn = sqlite3.connect(db_path)  # Ouvre SQLite
+        cur = conn.cursor()  # Cree un curseur
 
-        matches.sort(key=lambda x: x[2], reverse=True)
-        return matches[:8]
-    except Exception:
-        return []
+        cur.execute("PRAGMA table_info(stat_objects)")  # Liste colonnes de stat_objects
+        cols = [r[1] for r in cur.fetchall()]  # Recupere noms colonnes
+        if "id_stat" not in cols:  # Si la colonne id_stat n'existe pas
+            cur.execute("ALTER TABLE stat_objects ADD COLUMN id_stat INTEGER")  # Ajoute id_stat
+            conn.commit()  # Valide
+
+        cur.execute("UPDATE stat_objects SET id_stat = rowid WHERE id_stat IS NULL")  # Remplit id_stat manquant
+        conn.commit()  # Valide la mise a jour
+        return True  # Ok
+    except Exception:  # Si erreur
+        return False  # Echec
+    finally:  # Toujours execute
+        if conn is not None:  # Si connexion ouverte
+            conn.close()  # Ferme
+
+def lire_colonnes_stat_objects(db_path):  # Fonction: recupere la liste des colonnes de stat_objects
+    conn = None  # Variable connexion
+    try:  # Bloc protegeant
+        conn = sqlite3.connect(db_path)  # Ouvre SQLite
+        cur = conn.cursor()  # Curseur
+        cur.execute("PRAGMA table_info(stat_objects)")  # Colonnes
+        cols = [r[1] for r in cur.fetchall()]  # Noms colonnes
+        return cols  # Retourne la liste
+    except Exception:  # Si erreur
+        return []  # Liste vide
+    finally:  # Toujours execute
+        if conn is not None:  # Si connexion ouverte
+            conn.close()  # Ferme
+
+def trouver_colonne_nom(columns):  # Fonction: tente de trouver la colonne "nom d'objet"
+    for c in columns:  # Parcourt toutes les colonnes
+        cl = c.lower()  # Version minuscule
+        if ("objet" in cl) or ("nom" in cl) or ("name" in cl) or ("designation" in cl):  # Heuristique nom
+            return c  # Retourne la meilleure colonne
+    return columns[1] if len(columns) > 1 else (columns[0] if columns else None)  # Secours
+
+def trouver_colonne_type(columns):  # Fonction: tente de trouver la colonne de type
+    for c in columns:  # Parcourt
+        if c.lower() in ("type", "types"):  # Match exact courant
+            return c  # Ok
+    for c in columns:  # Deuxieme passe
+        if "type" in c.lower():  # Match partiel
+            return c  # Ok
+    return None  # Introuvable
+
+def trouver_colonne_famille(columns):  # Fonction: tente de trouver la colonne famille
+    for c in columns:  # Parcourt
+        if "famil" in c.lower():  # Match sur "famil" (famille/family)
+            return c  # Ok
+    return None  # Introuvable
+
+def trouver_colonne_prix(columns):  # Fonction: tente de trouver la colonne prix
+    for c in columns:  # Parcourt
+        cl = c.lower()  # Minuscule
+        if ("prix" in cl) or ("price" in cl):  # Match prix/price
+            return c  # Ok
+    return None  # Introuvable
+
+# ---------------------------
+# Search (inclut TOUT, y compris objets crees et lies)
+# Cle de selection: rowid (fiable).
+# ---------------------------
+
+def chercher_objets_flou(db_path, search_term):  # Fonction: recherche floue dans stat_objects
+    try:  # Bloc protegeant
+        conn = sqlite3.connect(db_path)  # Ouvre SQLite
+        cur = conn.cursor()  # Curseur
+
+        cols = lire_colonnes_stat_objects(db_path)  # Recupere colonnes de stat_objects
+        if not cols:  # Si table introuvable / vide
+            conn.close()  # Ferme
+            return []  # Rien
+
+        name_col = trouver_colonne_nom(cols)  # Trouve la colonne nom
+        if not name_col:  # Si introuvable
+            conn.close()  # Ferme
+            return []  # Rien
+
+        cur.execute(f"SELECT rowid, [{name_col}] FROM stat_objects")  # Prend rowid + nom
+        all_objects = cur.fetchall()  # Liste (rowid, nom)
+        conn.close()  # Ferme (important en CGI)
+
+        if not search_term or len(search_term.strip()) < 2:  # Meme regle: pas de recherche < 2 caracteres
+            return []  # Rien
+
+        st = search_term.lower().strip()  # Normalise le terme
+        matches = []  # Resultats
+        for rid, oname in all_objects:  # Parcourt tous les objets
+            if oname is None:  # Ignore les noms nuls
+                continue  # Suite
+            ratio = difflib.SequenceMatcher(None, st, str(oname).lower()).ratio()  # Similarite 0..1
+            if ratio > 0.3:  # Meme seuil que ton code
+                matches.append((rid, oname, ratio))  # Stocke match
+
+        matches.sort(key=lambda x: x[2], reverse=True)  # Tri par score
+        return matches[:8]  # Top 8 (meme limite)
+    except Exception:  # Si erreur
+        return []  # Rien
 
 # ---------------------------
 # Counts parsing (compact)
 # Format: "rowid:qty,rowid:qty"
-# Example: "12:3,7:1"
+# Exemple: "12:3,7:1"
 # ---------------------------
-def parse_counts(compact_str):
-    counts = {}
-    if not compact_str:
-        return counts
-    parts = [p.strip() for p in compact_str.split(",") if p.strip()]
-    for p in parts:
-        if ":" not in p:
-            continue
-        a, b = p.split(":", 1)
-        try:
-            rid = int(a.strip())
-            cnt = int(b.strip())
-        except Exception:
-            continue
-        if cnt < 1:
-            cnt = 1
-        counts[rid] = cnt
-    return counts
+
+def parse_counts(compact_str):  # Fonction: transforme "12:3,7:1" en dict {12:3, 7:1}
+    counts = {}  # Dictionnaire resultat
+    if not compact_str:  # Si vide
+        return counts  # Retourne vide
+    parts = [p.strip() for p in compact_str.split(",") if p.strip()]  # Separe par virgule + nettoie
+    for p in parts:  # Parcourt chaque morceau
+        if ":" not in p:  # Si format invalide
+            continue  # Ignore
+        a, b = p.split(":", 1)  # Separe rowid et qty
+        try:  # Conversion en int
+            rid = int(a.strip())  # Rowid
+            cnt = int(b.strip())  # Quantite
+        except Exception:  # Si conversion impossible
+            continue  # Ignore
+        if cnt < 1:  # Regle: minimum 1
+            cnt = 1  # Force a 1
+        counts[rid] = cnt  # Stocke
+    return counts  # Retour
 
 # ---------------------------
 # Compute aggregated row for ALL columns
-# Rules:
-# - method fusion: sum numeric fields (with qty), otherwise "?"
-# - method moyenne: weighted avg numeric fields (with qty), otherwise "?"
-# - if no numeric values for a field: "?"
+# Regles:
+# - fusion: somme des champs numeriques (avec qty), sinon "?"
+# - moyenne: moyenne ponderee des champs numeriques (avec qty), sinon "?"
+# - si aucune valeur numerique: "?"
 # ---------------------------
-def compute_aggregates(db_path, selected_counts, method):
-    """
-    Returns dict: col_name -> value (float for numeric, "?" for impossible)
-    Also returns cols list.
-    """
-    cols = get_columns(db_path)
-    if not cols:
-        return {}, []
 
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
+def calculer_agregats(db_path, selected_counts, method):  # Fonction: calcule un dict col->valeur pour l'objet statistique
+    # IMPORTANT: ici c'etait un bug dans ta version: lire_parametre_get(db_path) ne peut pas marcher.
+    cols = lire_colonnes_stat_objects(db_path)  # Colonnes de stat_objects
+    if not cols:  # Si rien
+        return {}, []  # Retour vide
 
-    # fetch selected rows by rowid
-    rowids = list(selected_counts.keys())
-    if not rowids:
-        conn.close()
-        return {}, cols
+    conn = sqlite3.connect(db_path)  # Ouvre SQLite
+    cur = conn.cursor()  # Curseur
 
-    placeholders = ",".join(["?"] * len(rowids))
-    cur.execute(f"SELECT rowid, * FROM stat_objects WHERE rowid IN ({placeholders})", rowids)
-    rows = cur.fetchall()
-    conn.close()
+    rowids = list(selected_counts.keys())  # Liste des rowid selectionnes
+    if not rowids:  # Si rien
+        conn.close()  # Ferme
+        return {}, cols  # Retour
 
-    # rows schema: (rowid, col0, col1, col2, ...)
-    # Map rowid -> list(values)
-    data = {}
-    for r in rows:
-        rid = r[0]
-        data[rid] = list(r[1:])
+    placeholders = ",".join(["?"] * len(rowids))  # "?, ?, ?" pour la requete
+    cur.execute(f"SELECT rowid, * FROM stat_objects WHERE rowid IN ({placeholders})", rowids)  # Recupere les lignes
+    rows = cur.fetchall()  # Toutes les lignes selectionnees
+    conn.close()  # Ferme
 
-    # Determine numeric aggregation per column index
-    # For each col i, scan values of selected rows; if any int/float => numeric column
-    agg = {}
+    data = {}  # Map rowid -> liste des valeurs (sans rowid)
+    for r in rows:  # Parcourt chaque ligne
+        rid = r[0]  # rowid
+        data[rid] = list(r[1:])  # valeurs des colonnes
 
-    for i, col in enumerate(cols):
-        # gather numeric values with weights
-        nums = []
-        weights = []
-        for rid, w in selected_counts.items():
-            if rid not in data:
-                continue
-            v = data[rid][i] if i < len(data[rid]) else None
-            if isinstance(v, (int, float)):
-                nums.append(float(v) * float(w))
-                weights.append(int(w))
+    agg = {}  # Dictionnaire resultat col -> valeur
 
-        if not nums:
-            agg[col] = "?"
-            continue
+    for i, col in enumerate(cols):  # Pour chaque colonne
+        nums = []  # Valeurs numeriques * poids
+        weights = []  # Poids
+        for rid, w in selected_counts.items():  # Pour chaque objet selectionne
+            if rid not in data:  # Si rowid absent (cas rare)
+                continue  # Ignore
+            v = data[rid][i] if i < len(data[rid]) else None  # Valeur de la colonne
+            if isinstance(v, (int, float)):  # Regle: numeric uniquement
+                nums.append(float(v) * float(w))  # Ajoute valeur ponderee
+                weights.append(int(w))  # Ajoute poids
 
-        total_sum = sum(nums)
-        total_w = sum(weights)
+        if not nums:  # Si aucune valeur numerique
+            agg[col] = "?"  # Impossible
+            continue  # Colonne suivante
 
-        if method == "fusion":
-            agg[col] = total_sum
-        else:
-            agg[col] = (total_sum / float(total_w)) if total_w > 0 else "?"
+        total_sum = sum(nums)  # Somme ponderee
+        total_w = sum(weights)  # Somme des poids
 
-    return agg, cols
+        if method == "fusion":  # Si fusion
+            agg[col] = total_sum  # Somme
+        else:  # Sinon moyenne ponderee
+            agg[col] = (total_sum / float(total_w)) if total_w > 0 else "?"  # Moyenne
 
-def next_id_stat(db_path):
-    conn = None
-    try:
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        cur.execute("SELECT COALESCE(MAX(id_stat), 0) + 1 FROM stat_objects")
-        v = cur.fetchone()[0]
-        return int(v)
-    except Exception:
-        return None
-    finally:
-        if conn is not None:
-            conn.close()
+    return agg, cols  # Retourne dict + colonnes
+
+def prochain_id_stat(db_path):  # Fonction: calcule le prochain id_stat
+    conn = None  # Connexion
+    try:  # Bloc protegeant
+        conn = sqlite3.connect(db_path)  # Ouvre
+        cur = conn.cursor()  # Curseur
+        cur.execute("SELECT COALESCE(MAX(id_stat), 0) + 1 FROM stat_objects")  # Max + 1
+        v = cur.fetchone()[0]  # Recupere le resultat
+        return int(v)  # Renvoie int
+    except Exception:  # Si erreur
+        return None  # Pas d'id
+    finally:  # Toujours execute
+        if conn is not None:  # Si ouvert
+            conn.close()  # Ferme
 
 # ---------------------------
-# Create object stat (insert full row with computed columns)
-# - Ensures: liaison column exists, id_stat exists and filled
-# - Sets:
-#   name_col = name
-#   type_col = "Fusion" or "Moyenne ponderee"
-#   family_col = "Objet statistique"
-#   liaison = "null"
-#   id_stat = next integer
-# - For other cols: computed numeric or "?"
+# creer_objet_statistique
 # ---------------------------
-def create_stat_object(db_path, name, compact_counts, method):
-    counts = parse_counts(compact_counts)
-    if not counts:
-        return False, "Aucun objet selectionne."
 
-    cols = get_columns(db_path)
-    if not cols:
-        return False, "Table stat_objects introuvable."
+def creer_objet_statistique(db_path, name, compact_counts, method):  # Fonction: cree un objet statistique en base
+    counts = parse_counts(compact_counts)  # Parse la liste selectionnee
+    if not counts:  # Si rien selectionne
+        return False, "Aucun objet selectionne."  # Meme message
 
-    name_col = find_name_col(cols)
-    type_col = find_type_col(cols)
-    family_col = find_family_col(cols)
-    price_col = find_price_col(cols)
+    # IMPORTANT: ici c'etait aussi un bug dans ta version: lire_parametre_get(db_path) ne peut pas marcher.
+    cols = lire_colonnes_stat_objects(db_path)  # Colonnes stat_objects
+    if not cols:  # Si table introuvable
+        return False, "Table stat_objects introuvable."  # Meme message
 
-    if not name_col:
-        return False, "Colonne nom introuvable."
+    name_col = trouver_colonne_nom(cols)  # Colonne du nom
+    type_col = trouver_colonne_type(cols)  # Colonne type
+    family_col = trouver_colonne_famille(cols)  # Colonne famille
+    price_col = trouver_colonne_prix(cols)  # Colonne prix (optionnelle)
 
-    agg, cols = compute_aggregates(db_path, counts, method)
+    if not name_col:  # Si pas de colonne nom
+        return False, "Colonne nom introuvable."  # Meme message
 
-    # Ensure mandatory meta columns exist
-    ensure_column(db_path, "stat_objects", "liaison", "TEXT DEFAULT 'null'")
-    ensure_id_stat_filled(db_path)
+    agg, cols = calculer_agregats(db_path, counts, method)  # Calcule les champs agreges
 
-    # Override / set some fields
-    agg[name_col] = name
-    agg["liaison"] = "null"
+    assurer_colonne(db_path, "stat_objects", "liaison", "TEXT DEFAULT 'null'")  # Garantit liaison
+    assurer_id_stat_rempli(db_path)  # Garantit id_stat present + rempli
 
-    # id_stat
-    new_id = next_id_stat(db_path)
-    if new_id is not None:
-        agg["id_stat"] = new_id
+    agg[name_col] = name  # Force le nom de l'objet cree
+    agg["liaison"] = "null"  # Force liaison a "null"
 
-    # type / family
-    if type_col:
-        if method == "fusion":
-            agg[type_col] = "Fusion"
-        else:
-            agg[type_col] = "Moyenne ponderee"
-    if family_col:
-        agg[family_col] = "Objet statistique"
+    new_id = prochain_id_stat(db_path)  # Prochain id_stat
+    if new_id is not None:  # Si calcule
+        agg["id_stat"] = new_id  # Applique
 
-    # If price column exists and was "?" but we had numeric elsewhere, keep computed behavior.
-    # If price_col exists and method fusion => sum, moyenne => avg (already done by compute_aggregates)
-    if price_col and price_col not in agg:
-        agg[price_col] = "?"
+    if type_col:  # Si colonne type existe
+        if method == "fusion":  # Si fusion
+            agg[type_col] = "Fusion"  # Texte
+        else:  # Sinon
+            agg[type_col] = "Moyenne ponderee"  # Texte
 
-    # Build INSERT: include all columns we can write (excluding the original first PK if any)
-    # We will insert only columns that exist in table.
-    insert_cols = []
-    insert_vals = []
-    for c in cols:
-        # skip original first column if you want (unknown PK). But we keep it: if it's not numeric we will set "?"
-        # safer: do not touch first column if it is an original PK used by your dataset
-        # => skip cols[0]
-        pass
+    if family_col:  # Si colonne famille existe
+        agg[family_col] = "Objet statistique"  # Force
 
-    # IMPORTANT: avoid overwriting the dataset's original "id" if it exists as cols[0]
-    # We insert all columns EXCEPT cols[0] (original id/Objet etc).
-    # This keeps SQLite assigning NULL/default to that column if allowed.
-    if len(cols) >= 1:
-        cols_to_insert = cols[1:]
-    else:
-        cols_to_insert = cols[:]
+    if price_col and price_col not in agg:  # Si prix existe mais pas calcule (cas securite)
+        agg[price_col] = "?"  # Met "?"
 
-    for c in cols_to_insert:
-        insert_cols.append(c)
-        v = agg.get(c, "?")
-        insert_vals.append(v)
+    # IMPORTANT: on n'ecrase pas la premiere colonne d'origine (souvent un id/cle metier)
+    if len(cols) >= 1:  # Si au moins une colonne
+        cols_to_insert = cols[1:]  # On ignore cols[0]
+    else:  # Sinon
+        cols_to_insert = cols[:]  # Rien a ignorer
 
-    # Ensure liaison/id_stat included if they exist and are not in cols_to_insert
-    # (in case liaison/id_stat were at index 0 for some reason)
-    for extra in ("liaison", "id_stat"):
-        if extra in cols and extra not in cols_to_insert:
-            insert_cols.append(extra)
-            insert_vals.append(agg.get(extra, "?"))
+    insert_cols = []  # Colonnes a inserer
+    insert_vals = []  # Valeurs a inserer
 
-    cols_sql = ",".join([f"[{c}]" for c in insert_cols])
-    ph = ",".join(["?"] * len(insert_vals))
+    for c in cols_to_insert:  # Parcourt les colonnes a inserer
+        insert_cols.append(c)  # Ajoute la colonne
+        insert_vals.append(agg.get(c, "?"))  # Ajoute la valeur ou "?"
 
-    conn = None
-    try:
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        cur.execute(f"INSERT INTO stat_objects ({cols_sql}) VALUES ({ph})", insert_vals)
+    # Securite: si liaison/id_stat etaient dans cols mais pas dans cols_to_insert
+    for extra in ("liaison", "id_stat"):  # Colonnes meta
+        if extra in cols and extra not in cols_to_insert:  # Si existe et pas deja prevu
+            insert_cols.append(extra)  # Ajoute colonne
+            insert_vals.append(agg.get(extra, "?"))  # Ajoute valeur
 
-        # If fusion: mark used objects as linked (optional; you had that behavior)
-        if method == "fusion":
-            # only if column exists
-            if "liaison" in cols:
-                cur.execute(
+    cols_sql = ",".join([f"[{c}]" for c in insert_cols])  # Colonnes entre crochets
+    ph = ",".join(["?"] * len(insert_vals))  # Placeholders
+
+    conn = None  # Connexion
+    try:  # Bloc protegeant
+        conn = sqlite3.connect(db_path)  # Ouvre
+        cur = conn.cursor()  # Curseur
+        cur.execute(f"INSERT INTO stat_objects ({cols_sql}) VALUES ({ph})", insert_vals)  # Insertion
+
+        if method == "fusion":  # Si fusion
+            if "liaison" in cols:  # Si colonne liaison existe
+                cur.execute(  # Mise a jour liaison pour les objets utilises
                     f"UPDATE stat_objects SET liaison = ? WHERE rowid IN ({','.join(['?']*len(counts))})",
                     [f"lie a {name}"] + list(counts.keys())
                 )
 
-        conn.commit()
-        return True, "Objet cree avec succes !"
-    except Exception as e:
-        return False, f"Erreur: {e}"
-    finally:
-        if conn is not None:
-            conn.close()
+        conn.commit()  # Valide
+        return True, "Objet cree avec succes !"  # Meme message
+    except Exception as e:  # Si erreur SQL
+        return False, f"Erreur: {e}"  # Meme format
+    finally:  # Toujours execute
+        if conn is not None:  # Si ouvert
+            conn.close()  # Ferme
 
 # ---------------------------
-# Main
+# Main (logique CGI)
 # ---------------------------
-universe_id = get_param("uid", "")
-action = get_param("action", "")
 
-db_path = universe_path(universe_id)
+universe_id = lire_parametre_get("uid", "")  # Recupere l'id de l'univers
+action = lire_parametre_get("action", "")  # Recupere l'action demandee
 
-# ensure columns
-if universe_id:
-    ensure_column(db_path, "stat_objects", "liaison", "TEXT DEFAULT 'null'")
-    ensure_id_stat_filled(db_path)
+db_path = chemin_univers(universe_id)  # Calcule le chemin du fichier .db
 
-msg = ""
-msg_class = "ok"
+if universe_id:  # Si universe_id fourni
+    assurer_colonne(db_path, "stat_objects", "liaison", "TEXT DEFAULT 'null'")  # S'assure liaison existe
+    assurer_id_stat_rempli(db_path)  # S'assure id_stat existe et rempli
 
-if action == "search":
-    term = get_param("search", "")
-    results = search_objects(db_path, term)
-    if results:
-        for rid, oname, _ in results:
-            safe_name = str(oname).replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
-            print(f"<div class='suggest-item' onclick=\"addObject({rid}, '{safe_name}')\">{esc(oname)}</div>")
-    else:
-        print("<div class='suggest-empty'>Aucune proposition</div>")
-    raise SystemExit
+msg = ""  # Message a afficher
+msg_class = "ok"  # Classe CSS du message
 
-if action == "create":
-    new_name = get_param("name", "").strip()
-    counts_compact = get_param("object_counts", "").strip()
-    method = get_param("method", "moyenne").strip()
+if action == "search":  # Mode "suggestions" (appel AJAX)
+    term = lire_parametre_get("search", "")  # Terme de recherche
+    results = chercher_objets_flou(db_path, term)  # Resultats
+    if results:  # Si on a des suggestions
+        for rid, oname, _ in results:  # Pour chaque suggestion
+            safe_name = str(oname).replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')  # Echappe JS
+            print(f"<div class='suggest-item' onclick=\"ajouter_objet({rid}, '{safe_name}')\">{echapper_html(oname)}</div>")  # HTML
+    else:  # Sinon
+        print("<div class='suggest-empty'>Aucune proposition</div>")  # Message vide
+    raise SystemExit  # IMPORTANT: ne pas rendre la page complete en mode search
 
-    if new_name and counts_compact:
-        ok, msg = create_stat_object(db_path, new_name, counts_compact, method)
-        msg_class = "ok" if ok else "err"
-    else:
-        msg = "Nom ou liste d'objets manquants."
-        msg_class = "err"
+if action == "create":  # Mode creation d'objet
+    new_name = lire_parametre_get("name", "").strip()  # Nom saisi
+    counts_compact = lire_parametre_get("object_counts", "").strip()  # Liste compacte rowid:qty
+    method = lire_parametre_get("method", "moyenne").strip()  # Methode (moyenne/fusion)
 
-# Back target (adjust if needed)
-back_href = f"/cgi-bin/univers_dashboard.py?uid={urllib.parse.quote(universe_id)}"
+    if new_name and counts_compact:  # Si on a les infos
+        ok, msg = creer_objet_statistique(db_path, new_name, counts_compact, method)  # Cree l'objet
+        msg_class = "ok" if ok else "err"  # Classe du message
+    else:  # Sinon
+        msg = "Nom ou liste d'objets manquants."  # Message d'erreur
+        msg_class = "err"  # Classe d'erreur
+
+back_href = f"/cgi-bin/univers_dashboard.py?uid={urllib.parse.quote(universe_id)}"  # Lien retour
 
 # ---------------------------
-# HTML
+# HTML (page complete)
 # ---------------------------
+
 print(f"""<!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="utf-8">
 <title>Creation d'objet statistique</title>
+
 <style>
+/* ------------------------------------------------------------
+   THEME GLOBAL
+   - fond + texte
+   - harmonise avec vos pages "panel"
+------------------------------------------------------------ */
+:root {{
+    --txt: #ffffff;
+    --muted: rgba(255,255,255,0.75);
+    --panel-bg: rgba(0,0,0,0.40);
+    --line: rgba(255,255,255,0.10);
+    --focus: rgba(255, 232, 180, 0.85); /* petit rappel "jaune" */
+    --btn: rgba(74, 42, 80, 0.92);
+    --btn-hover: rgba(94, 52, 102, 0.95);
+    --danger: #a83434;
+}}
+
 body {{
-    margin: 0;
-    font-family: Arial, sans-serif;
-    color: white;
-    background-image: url('/create_stat_object.png');
-    background-size: cover;
-    background-position: center;
-    background-repeat: no-repeat;
-    min-height: 100vh;
+    margin: 0; /* Supprime les marges par defaut */
+    font-family: Arial, sans-serif; /* Police simple */
+    color: var(--txt); /* Texte blanc */
+    background-image: url('/create_stat_object.png'); /* Image de fond */
+    background-size: cover; /* Remplit l'ecran */
+    background-position: center; /* Centre */
+    background-repeat: no-repeat; /* Pas de repetition */
+    min-height: 100vh; /* Hauteur mini */
 }}
 
+/* ------------------------------------------------------------
+   BOUTON RETOUR (jaune) - plus petit + hover propre
+------------------------------------------------------------ */
 .back-btn {{
-    position: fixed;
-    top: 18px;
-    left: 18px;
-    width: 48px;
-    height: 48px;
-    z-index: 50;
+    position: fixed; /* Reste visible */
+    top: 18px; /* Marge haut */
+    left: 18px; /* Marge gauche */
+    width: 52px; /* Plus petit qu'avant */
+    height: 52px; /* Plus petit qu'avant */
+    display: block; /* Bloc */
+    background: url('/back_btn_jaune.png') no-repeat center; /* Image bouton */
+    background-size: contain; /* Contient */
+    transition: transform 0.18s ease, filter 0.18s ease; /* Animation douce */
+    filter: drop-shadow(0 6px 14px rgba(0,0,0,0.45)); /* Ombre */
+    z-index: 999; /* Au dessus du panel */
 }}
-.back-btn img {{
-    width: 48px;
-    height: 48px;
-    display: block;
+.back-btn:hover {{
+    transform: scale(1.08); /* Petit zoom, pas agressif */
+    filter: drop-shadow(0 8px 18px rgba(0,0,0,0.55)) brightness(1.05);
 }}
 
+/* ------------------------------------------------------------
+   PANNEAU CENTRAL
+------------------------------------------------------------ */
 .panel {{
-    width: 900px;
-    margin: 60px auto;
-    background: url('/fond_filtre_pannel.png') no-repeat center;
-    background-size: 100% 100%;
-    padding: 50px;
-    border-radius: 20px;
+    width: 920px; /* Largeur stable */
+    margin: 72px auto; /* Centre + espace top */
+    background: url('/fond_filtre_pannel.png') no-repeat center; /* Panel */
+    background-size: 100% 100%; /* Etire */
+    padding: 46px 52px; /* Air autour */
+    border-radius: 22px; /* Arrondis */
+    box-sizing: border-box; /* Evite debordement */
 }}
 
-h1 {{ text-align: center; margin-top: 0; }}
+/* Titre */
+h1 {{
+    text-align: center; /* Centre */
+    margin: 0 0 22px 0; /* Espace dessous */
+    letter-spacing: 0.3px; /* Micro style */
+}}
 
-label {{ display:block; margin: 15px 0 6px; font-weight: bold; }}
+/* ------------------------------------------------------------
+   FORMULAIRES / CHAMPS
+------------------------------------------------------------ */
+label {{
+    display:block; /* Sur une ligne */
+    margin: 14px 0 8px; /* Espace */
+    font-weight: bold; /* Gras */
+    color: var(--txt); /* Blanc */
+}}
 
 input[type=text] {{
-    width: 100%;
-    padding: 12px;
-    border-radius: 6px;
-    border: none;
-    outline: none;
-    font-size: 14px;
+    width: 100%; /* Pleine largeur */
+    padding: 12px 14px; /* Confort */
+    border-radius: 12px; /* Arrondi moderne */
+    border: 1px solid rgba(255,255,255,0.10); /* Bordure douce */
+    background: rgba(0,0,0,0.38); /* Fond sombre */
+    color: var(--txt); /* Texte blanc */
+    outline: none; /* Pas de contour bleu */
+    font-size: 14px; /* Taille */
+    box-sizing: border-box; /* Stable */
 }}
-
-#suggestions {{
-    margin-top: 8px;
-    background: rgba(0,0,0,0.55);
-    border-radius: 10px;
-    padding: 8px;
-    min-height: 24px;
+input[type=text]::placeholder {{
+    color: rgba(255,255,255,0.55); /* Placeholder doux */
 }}
-
-.suggest-item {{
-    padding: 8px 10px;
-    border-radius: 8px;
-    cursor: pointer;
-}}
-.suggest-item:hover {{
-    background: rgba(255,255,255,0.08);
-}}
-
-.suggest-empty {{
-    color: #bbb;
-    font-size: 12px;
-    padding: 6px 10px;
-}}
-
-.selected-box {{
-    margin-top: 25px;
-    padding: 18px;
-    background: rgba(0,0,0,0.45);
-    border-radius: 14px;
-}}
-
-.selected-item {{
-    display:flex;
-    justify-content: space-between;
-    align-items:center;
-    background: rgba(255,255,255,0.06);
-    border-radius: 10px;
-    padding: 10px 12px;
-    margin-top: 10px;
-}}
-
-.left {{
-    display:flex;
-    align-items:center;
-    gap: 10px;
-}}
-
-.badge {{
-    display:inline-block;
-    padding: 4px 8px;
-    border-radius: 999px;
-    background: rgba(255,255,255,0.12);
-    font-size: 12px;
-}}
-
-.qty {{
-    width: 76px;
-    padding: 6px 8px;
-    border-radius: 8px;
-    border: none;
-    outline: none;
-}}
-
-.btn-del {{
-    background: #a83434;
-    color: white;
-    border: none;
-    border-radius: 8px;
-    padding: 8px 14px;
-    cursor:pointer;
+input[type=text]:focus {{
+    border-color: rgba(255,232,180,0.55); /* Focus jaune doux */
+    box-shadow: 0 0 0 3px rgba(255,232,180,0.14); /* Halo */
 }}
 
 select {{
-    width: 100%;
-    padding: 12px;
-    border-radius: 6px;
-    border: none;
-    outline: none;
+    width: 100%; /* Pleine largeur */
+    padding: 12px 14px; /* Confort */
+    border-radius: 12px; /* Arrondi */
+    border: 1px solid rgba(255,255,255,0.10); /* Bordure */
+    background: rgba(0,0,0,0.38); /* Fond */
+    color: var(--txt); /* Texte */
+    outline: none; /* Pas de contour */
+    box-sizing: border-box; /* Stable */
+}}
+select:focus {{
+    border-color: rgba(255,232,180,0.55); /* Focus */
+    box-shadow: 0 0 0 3px rgba(255,232,180,0.14); /* Halo */
 }}
 
+/* ------------------------------------------------------------
+   SUGGESTIONS (resultats de recherche)
+------------------------------------------------------------ */
+#suggestions {{
+    margin-top: 10px; /* Espace */
+    background: rgba(0,0,0,0.42); /* Fond */
+    border: 1px solid rgba(255,255,255,0.08); /* Bordure douce */
+    border-radius: 14px; /* Arrondi */
+    padding: 8px; /* Air */
+    min-height: 24px; /* Hauteur mini */
+}}
+
+.suggest-item {{
+    padding: 10px 12px; /* Zone cliquable */
+    border-radius: 12px; /* Arrondi */
+    cursor: pointer; /* Main */
+    transition: background 0.12s ease, transform 0.12s ease; /* Hover doux */
+}}
+.suggest-item:hover {{
+    background: rgba(255,255,255,0.08); /* Hover */
+    transform: translateY(-1px); /* Micro lift */
+}}
+
+.suggest-empty {{
+    color: rgba(255,255,255,0.60); /* Texte doux */
+    font-size: 12px; /* Petit */
+    padding: 8px 10px; /* Air */
+}}
+
+/* ------------------------------------------------------------
+   LISTE DES OBJETS SELECTIONNES
+------------------------------------------------------------ */
+.selected-box {{
+    margin-top: 22px; /* Espace */
+    padding: 16px; /* Air */
+    background: rgba(0,0,0,0.36); /* Fond */
+    border: 1px solid rgba(255,255,255,0.08); /* Bordure */
+    border-radius: 16px; /* Arrondi */
+}}
+
+.selected-item {{
+    display:flex; /* Ligne */
+    justify-content: space-between; /* Bouton a droite */
+    align-items:center; /* Alignement */
+    background: rgba(255,255,255,0.06); /* Fond item */
+    border: 1px solid rgba(255,255,255,0.08); /* Bordure item */
+    border-radius: 14px; /* Arrondi */
+    padding: 10px 12px; /* Air */
+    margin-top: 10px; /* Espace */
+}}
+
+.left {{
+    display:flex; /* Ligne */
+    align-items:center; /* Centrage */
+    gap: 10px; /* Espacement */
+    min-width: 0; /* Pour eviter debordement */
+}}
+
+.left b {{
+    display:block; /* Bloc */
+    max-width: 380px; /* Coupe les noms trop longs */
+    white-space: nowrap; /* Sur une ligne */
+    overflow: hidden; /* Cache */
+    text-overflow: ellipsis; /* ... */
+}}
+
+.badge {{
+    display:inline-block; /* Petit badge */
+    padding: 4px 10px; /* Air */
+    border-radius: 999px; /* Pilule */
+    background: rgba(255,232,180,0.16); /* Jaune doux */
+    border: 1px solid rgba(255,232,180,0.22); /* Bordure */
+    font-size: 12px; /* Petit */
+    color: rgba(255,232,180,0.95); /* Texte jaune */
+}}
+
+.qty {{
+    width: 80px; /* Largeur */
+    padding: 7px 8px; /* Air */
+    border-radius: 12px; /* Arrondi */
+    border: 1px solid rgba(255,255,255,0.10); /* Bordure */
+    outline: none; /* Pas de contour */
+    background: rgba(0,0,0,0.32); /* Fond */
+    color: var(--txt); /* Texte */
+}}
+
+.btn-del {{
+    background: rgba(168,52,52,0.95); /* Rouge */
+    color: white; /* Texte */
+    border: none; /* Pas de bordure */
+    border-radius: 12px; /* Arrondi */
+    padding: 9px 14px; /* Air */
+    cursor:pointer; /* Main */
+    transition: transform 0.12s ease, filter 0.12s ease; /* Hover */
+}}
+.btn-del:hover {{
+    transform: scale(1.03); /* Petit zoom */
+    filter: brightness(1.05); /* Leger */
+}}
+
+/* ------------------------------------------------------------
+   BOUTON PRINCIPAL (creer)
+------------------------------------------------------------ */
 .btn-main {{
-    margin-top: 18px;
-    padding: 12px 18px;
-    border-radius: 10px;
-    border: none;
-    cursor:pointer;
-    background: rgba(120,80,160,0.9);
-    color:white;
-    font-weight:bold;
+    width: 100%; /* Pleine largeur */
+    margin-top: 18px; /* Espace */
+    padding: 13px 18px; /* Air */
+    border-radius: 14px; /* Arrondi */
+    border: none; /* Sans bordure */
+    cursor:pointer; /* Main */
+    background: var(--btn); /* Violet */
+    color:white; /* Blanc */
+    font-weight:bold; /* Gras */
+    letter-spacing: 0.2px; /* Micro style */
+    transition: transform 0.12s ease, background 0.12s ease, filter 0.12s ease; /* Hover */
+}}
+.btn-main:hover {{
+    background: var(--btn-hover); /* Violet hover */
+    transform: translateY(-1px); /* Lift */
+    filter: brightness(1.03); /* Leger */
 }}
 
+/* ------------------------------------------------------------
+   MESSAGE (OK / ERREUR)
+------------------------------------------------------------ */
 .msg {{
-    margin-top: 15px;
-    padding: 10px;
-    border-radius: 8px;
-    text-align:center;
+    margin-top: 16px; /* Espace */
+    padding: 12px 14px; /* Air */
+    border-radius: 14px; /* Arrondi */
+    text-align:center; /* Centre */
+    border: 1px solid rgba(255,255,255,0.10); /* Bordure */
 }}
-.msg.ok {{ background: rgba(0,128,0,0.35); }}
-.msg.err {{ background: rgba(128,0,0,0.35); }}
+.msg.ok {{
+    background: rgba(0,128,0,0.28); /* Vert transparent */
+}}
+.msg.err {{
+    background: rgba(128,0,0,0.28); /* Rouge transparent */
+}}
+
+/* ------------------------------------------------------------
+   LIEN "liste des objets"
+------------------------------------------------------------ */
+.lien-liste {{
+    display:inline-block; /* Bloc cliquable */
+    margin-top: 18px; /* Espace */
+    padding: 10px 14px; /* Air */
+    border-radius: 12px; /* Arrondi */
+    background: rgba(0,0,0,0.30); /* Fond */
+    border: 1px solid rgba(255,255,255,0.10); /* Bordure */
+    color: rgba(255,255,255,0.92); /* Texte */
+    text-decoration:none; /* Pas de soulignement */
+    font-weight: bold; /* Gras */
+    transition: transform 0.12s ease, background 0.12s ease; /* Hover */
+}}
+.lien-liste:hover {{
+    background: rgba(0,0,0,0.42); /* Hover */
+    transform: translateY(-1px); /* Lift */
+}}
 </style>
 
 <script>
-var selected = {{}};
+/* ------------------------------------------------------------
+   JS (logique identique)
+   - juste renommage en francais (variables + fonctions)
+------------------------------------------------------------ */
 
-function refreshHidden() {{
-    var parts = [];
-    for (var k in selected) {{
-        if (!selected.hasOwnProperty(k)) continue;
-        var v = parseInt(selected[k].count, 10);
+var objets_selectionnes = {{}};  // Dictionnaire: rowid -> {{ nom, quantite }}
+
+function rafraichir_champ_cache() {{
+    var morceaux = [];
+    for (var k in objets_selectionnes) {{
+        if (!objets_selectionnes.hasOwnProperty(k)) continue;
+        var v = parseInt(objets_selectionnes[k].quantite, 10);
         if (isNaN(v) || v < 1) v = 1;
-        parts.push(k + ":" + v);
+        morceaux.push(k + ":" + v);
     }}
-    document.getElementById("object_counts").value = parts.join(",");
+    document.getElementById("object_counts").value = morceaux.join(",");
 }}
 
-function renderSelected() {{
+function afficher_selection() {{
     var box = document.getElementById("selected_list");
     box.innerHTML = "";
 
-    var keys = Object.keys(selected);
-    if (keys.length === 0) {{
-        box.innerHTML = "<div style='color:#bbb'>Aucun objet selectionne.</div>";
-        refreshHidden();
+    var cles = Object.keys(objets_selectionnes);
+    if (cles.length === 0) {{
+        box.innerHTML = "<div style='color:rgba(255,255,255,0.65)'>Aucun objet selectionne.</div>";
+        rafraichir_champ_cache();
         return;
     }}
 
-    keys.sort(function(a,b){{ return parseInt(a,10) - parseInt(b,10); }});
+    cles.sort(function(a,b){{ return parseInt(a,10) - parseInt(b,10); }});
 
-    for (var i=0;i<keys.length;i++) {{
-        var id = keys[i];
-        var item = selected[id];
+    for (var i=0;i<cles.length;i++) {{
+        var id = cles[i];
+        var item = objets_selectionnes[id];
 
         var row = document.createElement("div");
         row.className = "selected-item";
@@ -606,38 +702,39 @@ function renderSelected() {{
         var left = document.createElement("div");
         left.className = "left";
 
-        var name = document.createElement("div");
-        name.innerHTML = "<b>" + item.name + "</b>";
+        var nom = document.createElement("div");
+        nom.innerHTML = "<b>" + item.nom + "</b>";
 
         var badge = document.createElement("span");
         badge.className = "badge";
-        badge.textContent = "x" + item.count;
+        badge.textContent = "x" + item.quantite;
 
         var qty = document.createElement("input");
         qty.type = "number";
         qty.min = "1";
         qty.className = "qty";
-        qty.value = item.count;
-        qty.onchange = (function(myId) {{
+        qty.value = item.quantite;
+        qty.onchange = (function(monId) {{
             return function() {{
                 var v = parseInt(this.value, 10);
                 if (isNaN(v) || v < 1) v = 1;
-                selected[myId].count = v;
-                renderSelected();
+                objets_selectionnes[monId].quantite = v;
+                afficher_selection();
             }};
         }})(id);
 
-        left.appendChild(name);
+        left.appendChild(nom);
         left.appendChild(badge);
         left.appendChild(qty);
 
         var del = document.createElement("button");
         del.className = "btn-del";
+        del.type = "button";
         del.textContent = "Supprimer";
-        del.onclick = (function(myId) {{
+        del.onclick = (function(monId) {{
             return function() {{
-                delete selected[myId];
-                renderSelected();
+                delete objets_selectionnes[monId];
+                afficher_selection();
             }};
         }})(id);
 
@@ -647,23 +744,23 @@ function renderSelected() {{
         box.appendChild(row);
     }}
 
-    refreshHidden();
+    rafraichir_champ_cache();
 }}
 
-function addObject(rowid, name) {{
+function ajouter_objet(rowid, nom) {{
     var id = String(rowid);
-    if (selected[id]) {{
-        selected[id].count = parseInt(selected[id].count, 10) + 1;
+    if (objets_selectionnes[id]) {{
+        objets_selectionnes[id].quantite = parseInt(objets_selectionnes[id].quantite, 10) + 1;
     }} else {{
-        selected[id] = {{ name: name, count: 1 }};
+        objets_selectionnes[id] = {{ nom: nom, quantite: 1 }};
     }}
-    renderSelected();
+    afficher_selection();
 }}
 
-function doSearch() {{
+function lancer_recherche() {{
     var q = document.getElementById("search").value;
     var xhr = new XMLHttpRequest();
-    xhr.open("GET", "?uid={esc(universe_id)}&action=search&search=" + encodeURIComponent(q), true);
+    xhr.open("GET", "?uid={echapper_html(universe_id)}&action=search&search=" + encodeURIComponent(q), true);
     xhr.onreadystatechange = function() {{
         if (xhr.readyState === 4 && xhr.status === 200) {{
             document.getElementById("suggestions").innerHTML = xhr.responseText;
@@ -672,15 +769,15 @@ function doSearch() {{
     xhr.send();
 }}
 
-function init() {{
-    renderSelected();
+function initialiser_page() {{
+    afficher_selection();
 }}
 </script>
 
 </head>
-<body onload="init()">
+<body onload="initialiser_page()">
 
-<a class="back-btn" href="{esc(back_href)}"><img src="/back_btn_jaune.png" alt="Retour"></a>
+<a class="back-btn" href="{echapper_html(back_href)}" title="Retour"></a>
 
 <div class="panel">
     <h1>Creation d'objet statistique</h1>
@@ -689,7 +786,7 @@ function init() {{
     <input type="text" id="name" placeholder="Ex: Ecole, Bureau, etc.">
 
     <label>Rechercher des objets :</label>
-    <input type="text" id="search" placeholder="Chercher un objet..." onkeyup="doSearch()">
+    <input type="text" id="search" placeholder="Chercher un objet..." onkeyup="lancer_recherche()">
 
     <div id="suggestions"></div>
 
@@ -704,8 +801,8 @@ function init() {{
         <option value="fusion">Fusion (somme)</option>
     </select>
 
-    <form method="GET" action="">
-        <input type="hidden" name="uid" value="{esc(universe_id)}">
+    <form method="GET" action="" style="margin-top:6px;">
+        <input type="hidden" name="uid" value="{echapper_html(universe_id)}">
         <input type="hidden" name="action" value="create">
         <input type="hidden" name="name" id="hidden_name">
         <input type="hidden" name="method" id="hidden_method">
@@ -713,14 +810,14 @@ function init() {{
         <button type="submit" class="btn-main" onclick="
             document.getElementById('hidden_name').value = document.getElementById('name').value;
             document.getElementById('hidden_method').value = document.getElementById('method').value;
-            refreshHidden();
+            rafraichir_champ_cache();
         ">Creer l'objet statistique</button>
     </form>
 
-    {"<div class='msg " + esc(msg_class) + "'>" + esc(msg) + "</div>" if msg else ""}
+    {"<div class='msg " + echapper_html(msg_class) + "'>" + echapper_html(msg) + "</div>" if msg else ""}
 
-    <div style="margin-top:20px; text-align:center;">
-        <a href="/cgi-bin/liste_objets.py?uid={esc(universe_id)}" style="color:white; text-decoration:none; font-weight:bold;">Liste des objets crees</a>
+    <div style="text-align:center;">
+        <a class="lien-liste" href="/cgi-bin/liste_objets.py?uid={echapper_html(universe_id)}">Liste des objets crees</a>
     </div>
 </div>
 
