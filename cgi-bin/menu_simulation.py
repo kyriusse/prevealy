@@ -143,7 +143,7 @@ uid_encode = urllib.parse.quote(uid)                  # uid encode pour URL
 panels = [
     {
         "titre": "Liaison",
-        "badge": "Noyau",
+        "badge": "Noyau (Prively 1.1)",
         "description": (
             "Lie des objets entre eux, mais aussi a des evenements, psychologie, etc. "
             "Outil complexe pour construire un monde coherent."
@@ -152,12 +152,12 @@ panels = [
     },
     {
         "titre": "Simulation Calcule",
-        "badge": "Deterministe",
+        "badge": "Deterministe (Beta)",
         "description": (
             "Simulation deterministe basee sur prix, quantites et coefficients. "
             "Calcule total moyen, min/max et projection a N annees."
         ),
-        "fichier": "simulation_calcule.py"
+        "fichier": "sim_calc.py"
     },
     {
         "titre": "Simulation Monte Carlo",

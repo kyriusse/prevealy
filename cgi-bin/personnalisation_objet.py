@@ -798,7 +798,7 @@ function initialiser_page() {{
     <label>Methode :</label>
     <select id="method">
         <option value="moyenne">Moyenne ponderee</option>
-        <option value="fusion">Fusion (somme)</option>
+        <option value="fusion">Fusion (liaison)</option>
     </select>
 
     <form method="GET" action="" style="margin-top:6px;">
