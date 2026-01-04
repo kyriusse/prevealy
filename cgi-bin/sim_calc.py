@@ -1,680 +1,649 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# sim_calc.py
+# Moteur de simulation deterministe (sans CGI, sans HTML)
+#
+# Objectif:
+# - Interpreter une projection sur N annees
+# - Appliquer les "evenements" (Ep principalement)
+# - Tenir compte des liaisons (propagation)
+#
+# IMPORTANT:
+# - Ce fichier ne doit jamais faire de print HTML
+# - Il doit juste fournir des fonctions "propres" reutilisables
 
-"""
-sim_calc.py
------------
-Simulation deterministe (base) dans un univers.
-
-Principe:
-- On utilise les donnees "objets" (prix, quantite, coefficient...) de la BDD univers.
-- On peut activer 0..n evenements.
-- Chaque evenement fournit une liste d'impacts (impacts_evenements):
-  objet_id -> poids_final (deja calcule par liaison.py)
-- Effet deterministe simple:
-  valeur_effective_objet = valeur_base_objet * (1 + somme_poids_final_evenements_actifs_sur_objet)
-
-Sorties:
-- Total moyen, min, max (si on a des colonnes de type min/max, sinon on duplique le moyen)
-- Projection a N annees avec un taux annuel fixe (optionnel)
-
-Contraintes:
-- Sans JavaScript
-- Variables en francais
-- Commentaires partout (sauf evidences)
-"""
-
-import os
-import sqlite3
-import urllib.parse
-import html
+from stats_utils import facteur_speculation, facteur_utilisation
 
 
 # ============================================================
-# En-tete CGI obligatoire
+# Constantes moteur (faciles a regler plus tard)
 # ============================================================
-print("Content-Type: text/html; charset=utf-8\n")
+
+# Limite de propagation dans le reseau (liaisons_objets)
+PROFONDEUR_RESEAU_MAX = 6
+
+# Attenuation sur la propagation (niveau 1 -> *0.70, niveau 2 -> *0.70^2, ...)
+ATTENUATION_RESEAU = 0.70
+
+# Croissance annuelle par defaut si on ne sait pas faire mieux
+TAUX_PRIX_DEFAUT = 0.02
+TAUX_CA_DEFAUT = 0.01
 
 
 # ============================================================
-# Constantes
+# Outils internes: conversion robuste
 # ============================================================
-DOSSIER_UNIVERS = "cgi-bin/universes/"
 
-
-# ============================================================
-# Utils: lire parametre GET
-# ============================================================
-def lire_parametre_get(nom, defaut=""):
-    """Retourne la valeur GET (?nom=...) ou defaut si absent."""
-    query_string = os.environ.get("QUERY_STRING", "")
-    parametres = urllib.parse.parse_qs(query_string, keep_blank_values=True)
-    return parametres.get(nom, [defaut])[0]
-
-
-# ============================================================
-# Utils: echappement HTML
-# ============================================================
-def echapper_html(texte):
-    """Echappe un texte pour eviter d'injecter du HTML."""
-    return html.escape("" if texte is None else str(texte))
-
-
-# ============================================================
-# Utils: chemin BDD univers
-# ============================================================
-def construire_chemin_univers(uid):
-    """Construit le chemin de BDD univers avec uid nettoye."""
-    uid_sain = "".join([c for c in uid if c.isalnum() or c in ("-", "_")])
-    return os.path.join(DOSSIER_UNIVERS, "universe_" + uid_sain + ".db")
-
-
-# ============================================================
-# Utils: nom univers
-# ============================================================
-def recuperer_nom_univers(uid):
-    """Lit univers_names.txt et renvoie le nom correspondant."""
+def _float_robuste(texte, defaut=0.0):
+    """Convertit en float, accepte virgule, sinon defaut."""
     try:
-        chemin_fichier = os.path.join(DOSSIER_UNIVERS, "univers_names.txt")
-        if os.path.exists(chemin_fichier):
-            with open(chemin_fichier, "r", encoding="utf-8") as f:
-                for ligne in f:
-                    if "," in ligne:
-                        uid_lu, nom_lu = ligne.strip().split(",", 1)
-                        if uid_lu == uid:
-                            return nom_lu
+        return float(str(texte).replace(",", "."))
     except Exception:
-        pass
-    return "Nom inconnu"
+        return defaut
+
+
+def _int_robuste(texte, defaut=0):
+    """Convertit en int, sinon defaut."""
+    try:
+        return int(str(texte))
+    except Exception:
+        return defaut
 
 
 # ============================================================
-# Utils: detecter colonnes stat_objects (id + Objet)
+# Detection colonnes utiles dans stat_objects
 # ============================================================
-def detecter_colonnes_stat_objects(connexion):
-    """Detecte les colonnes clefs de stat_objects."""
+
+def detecter_colonnes_statistiques(connexion, nom_table="stat_objects"):
+    """
+    Detecte des colonnes probables:
+    - id
+    - nom (objet)
+    - prix_moyen, prix_min, prix_max
+    - ca
+    - famille, type
+    - speculation, taux_utilisation, coef_aug_prev
+
+    Retourne: dict {cle_interne: nom_colonne_sqlite_ou_None}
+    """
     cur = connexion.cursor()
-    cur.execute("PRAGMA table_info(stat_objects)")
+    cur.execute("PRAGMA table_info({})".format(nom_table))
     infos = cur.fetchall()
 
-    colonne_id = None
-    colonne_nom = None
-
+    # Liste de colonnes presentes (en minuscules) -> vrai nom
+    mapping_present = {}
     for col in infos:
         nom_col = col[1]
-        nom_min = (nom_col or "").lower()
-        if nom_min == "id":
-            colonne_id = nom_col
-        elif nom_min == "objet":
-            colonne_nom = nom_col
+        if nom_col is not None:
+            mapping_present[str(nom_col).lower()] = nom_col
 
-    if colonne_id is None and infos:
-        colonne_id = infos[0][1]
-    if colonne_nom is None and len(infos) >= 2:
-        colonne_nom = infos[1][1]
+    def prendre(*candidats):
+        """Renvoie la premiere colonne existante parmi candidats."""
+        for c in candidats:
+            cc = str(c).lower()
+            if cc in mapping_present:
+                return mapping_present[cc]
+        return None
 
-    return colonne_id, colonne_nom
+    colonnes = {}
+    colonnes["id"] = prendre("id")
+    colonnes["nom"] = prendre("objet", "nom", "name")
+    colonnes["prix_moyen"] = prendre("prix_moyen", "prix_moyen_actuel", "prixmoyen", "prix")
+    colonnes["prix_min"] = prendre("prix_min", "prix_min_eur", "min", "prixmin")
+    colonnes["prix_max"] = prendre("prix_max", "prix_max_eur", "max", "prixmax")
+    colonnes["ca"] = prendre("ca", "ca_2025_2035_mdeur", "chiffre_affaires", "chiffreaffaires")
+    colonnes["famille"] = prendre("famille")
+    colonnes["type"] = prendre("type")
+    colonnes["speculation"] = prendre("speculation")
+    colonnes["taux_utilisation"] = prendre("taux_utilisation", "utilisation")
+    colonnes["coef_aug_prev"] = prendre("coef_aug_prev", "coef_augmentation", "coef")
+
+    return colonnes
 
 
 # ============================================================
-# Utils: inspecter tables/colonnes
+# Lecture objets / selection (objets, famille, type)
 # ============================================================
-def table_existe(connexion, nom_table):
-    """Retourne True si une table existe dans la BDD."""
+
+def lister_objets_par_ids(connexion, colonnes, ids_objets, nom_table="stat_objects"):
+    """Retourne liste de dict pour chaque objet id."""
+    if not ids_objets:
+        return []
+
+    # IMPORTANT: requete parametree (IN) sans injection
+    placeholders = ",".join(["?"] * len(ids_objets))
     cur = connexion.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (nom_table,))
-    return cur.fetchone() is not None
+
+    cols_sql = []
+    for cle, nom_col in colonnes.items():
+        if nom_col:
+            cols_sql.append("[{}]".format(nom_col))
+
+    if not cols_sql:
+        return []
+
+    requete = "SELECT {} FROM {} WHERE [{}] IN ({})".format(
+        ", ".join(cols_sql),
+        nom_table,
+        colonnes["id"],
+        placeholders
+    )
+    cur.execute(requete, tuple(ids_objets))
+    lignes = cur.fetchall()
+
+    # Recomposer en dict
+    resultat = []
+    for lig in lignes:
+        d = {}
+        for i, nom_col in enumerate(cols_sql):
+            # nom_col = "[xxx]" -> extraire xxx
+            cle_reelle = nom_col.strip("[]")
+            d[cle_reelle] = lig[i]
+        resultat.append(d)
+
+    return resultat
 
 
-def colonnes_table(connexion, nom_table):
-    """Retourne la liste des colonnes d une table."""
-    cur = connexion.cursor()
-    cur.execute(f"PRAGMA table_info({nom_table})")
-    return [r[1] for r in cur.fetchall()]
-
-
-# ============================================================
-# Lecture evenements / impacts
-# ============================================================
-def lister_evenements(connexion, limite=200):
-    """Liste les evenements."""
+def lister_ids_objets_par_famille(connexion, colonnes, famille, nom_table="stat_objects"):
+    """Retourne ids de la famille donnee."""
+    if not famille or not colonnes.get("famille"):
+        return []
     cur = connexion.cursor()
     cur.execute(
-        """
-        SELECT id, nom, poids_global, intensite, duree, probabilite, tags, date_creation
-        FROM evenements
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (limite,)
+        "SELECT [{}] FROM {} WHERE [{}] = ?".format(
+            colonnes["id"], nom_table, colonnes["famille"]
+        ),
+        (famille,)
     )
-    return cur.fetchall()
+    return [r[0] for r in cur.fetchall()]
 
 
-def lire_impacts_evenements_actifs(connexion, liste_evenements_actifs):
-    """
-    Retourne un dictionnaire:
-      objet_id -> somme_poids_final
-    en sommant les poids_final de impacts_evenements pour les evenements actifs.
-    """
-    if not liste_evenements_actifs:
-        return {}
-
+def lister_ids_objets_par_type(connexion, colonnes, type_objet, nom_table="stat_objects"):
+    """Retourne ids du type donne."""
+    if not type_objet or not colonnes.get("type"):
+        return []
     cur = connexion.cursor()
-
-    # Construction d une clause IN sure (placeholders)
-    placeholders = ",".join(["?"] * len(liste_evenements_actifs))
-
     cur.execute(
-        f"""
-        SELECT objet_id, SUM(poids_final)
-        FROM impacts_evenements
-        WHERE evenement_id IN ({placeholders})
-        GROUP BY objet_id
-        """,
-        tuple(liste_evenements_actifs)
+        "SELECT [{}] FROM {} WHERE [{}] = ?".format(
+            colonnes["id"], nom_table, colonnes["type"]
+        ),
+        (type_objet,)
     )
+    return [r[0] for r in cur.fetchall()]
+
+
+# ============================================================
+# Reseau: liaisons_objets (propagation)
+# ============================================================
+
+def voisins_objet(connexion, objet_id):
+    """
+    Retourne la liste des voisins directs d un objet via liaisons_objets.
+    IMPORTANT: on suppose la table creee par liaison.py
+    """
+    cur = connexion.cursor()
+    try:
+        cur.execute(
+            "SELECT cible_objet_id FROM liaisons_objets WHERE source_objet_id = ?",
+            (objet_id,)
+        )
+        return [r[0] for r in cur.fetchall()]
+    except Exception:
+        return []
+
+
+def calculer_propagation_reseau(connexion, objets_depart, profondeur_max=PROFONDEUR_RESEAU_MAX, attenuation=ATTENUATION_RESEAU):
+    """
+    Propagation BFS:
+    - niveau 0: objets_depart
+    - niveau n: voisins de niveau n-1
+    - poids = attenuation^niveau
+
+    Retour:
+    - dict objet_id -> (niveau, poids)
+    """
+    if profondeur_max < 0:
+        profondeur_max = 0
+    if attenuation < 0.0:
+        attenuation = 0.0
+    if attenuation > 1.0:
+        attenuation = 1.0
 
     resultat = {}
-    for (oid, somme_poids) in cur.fetchall():
-        resultat[int(oid)] = float(somme_poids) if somme_poids is not None else 0.0
+    file_bfs = []
+
+    for oid in (objets_depart or []):
+        resultat[oid] = (0, 1.0)
+        file_bfs.append((oid, 0))
+
+    # BFS classique
+    while file_bfs:
+        courant, niv = file_bfs.pop(0)
+
+        if niv >= profondeur_max:
+            continue
+
+        niv_suiv = niv + 1
+        poids_suiv = (attenuation ** niv_suiv)
+
+        for v in voisins_objet(connexion, courant):
+            if v is None:
+                continue
+
+            if v not in resultat:
+                resultat[v] = (niv_suiv, poids_suiv)
+                file_bfs.append((v, niv_suiv))
+            else:
+                ancien_niv, ancien_poids = resultat[v]
+                # Garder le plus proche, ou le plus fort a niveau egal
+                if niv_suiv < ancien_niv:
+                    resultat[v] = (niv_suiv, poids_suiv)
+                    file_bfs.append((v, niv_suiv))
+                elif niv_suiv == ancien_niv and poids_suiv > ancien_poids:
+                    resultat[v] = (niv_suiv, poids_suiv)
 
     return resultat
 
 
 # ============================================================
-# Lecture "valeur base" d un objet
+# Evenements
 # ============================================================
-def lire_valeurs_base_objet(connexion, colonne_id, objet_id):
+
+def lire_evenement(connexion, evenement_id):
     """
-    Retourne (moyen, mini, maxi).
-
-    Cette fonction essaie d etre robuste:
-    - si tu as une table de prix type Prix_Objets dans l univers, adapte ici.
-    - sinon fallback: valeur=1.0
-
-    IMPORTANT:
-    - On essaye d utiliser:
-      * prix_moyen (ou prix) 
-      * prix_min / prix_max
-      * quantite
-      * coefficient
-
-    Si une colonne manque, on prend une valeur par defaut.
+    Lit un evenement dans la table evenements.
+    Fonction robuste: si colonnes manquent, on renvoie quand meme un dict.
     """
-    # Valeurs par defaut
-    prix_moyen = 1.0
-    prix_min = None
-    prix_max = None
-    quantite = 1.0
-    coefficient = 1.0
-
-    # Cas 1: si une table "stat_objects" porte deja ces infos (selon ton schema)
-    # On detecte quelques noms possibles de colonnes.
-    colonnes = colonnes_table(connexion, "stat_objects")
-
-    # Petites fonctions internes (evite repetition)
-    def lire_colonne_si_existe(nom_colonne):
-        return nom_colonne if nom_colonne in colonnes else None
-
-    # Noms possibles
-    col_prix = lire_colonne_si_existe("prix") or lire_colonne_si_existe("Prix") or lire_colonne_si_existe("prix_moyen") or lire_colonne_si_existe("Prix_moyen")
-    col_prix_min = lire_colonne_si_existe("prix_min") or lire_colonne_si_existe("Prix_min")
-    col_prix_max = lire_colonne_si_existe("prix_max") or lire_colonne_si_existe("Prix_max")
-    col_quantite = lire_colonne_si_existe("quantite") or lire_colonne_si_existe("Quantite")
-    col_coef = lire_colonne_si_existe("coefficient") or lire_colonne_si_existe("Coefficient") or lire_colonne_si_existe("coef") or lire_colonne_si_existe("Coef")
-
-    # Si au moins un champ semble exister, on lit la ligne
-    if col_prix or col_quantite or col_coef or col_prix_min or col_prix_max:
-        cur = connexion.cursor()
-        cur.execute(f"SELECT * FROM stat_objects WHERE [{colonne_id}] = ?", (objet_id,))
-        row = cur.fetchone()
-        if row:
-            # Recuperation via mapping index
-            # On construit un dict colonne->valeur
-            cur.execute("SELECT * FROM stat_objects LIMIT 1")
-            # Trick: utiliser cursor.description pour nommer les colonnes
-            cur.execute(f"SELECT * FROM stat_objects WHERE [{colonne_id}] = ? LIMIT 1", (objet_id,))
-            desc = [d[0] for d in cur.description]
-            ligne = cur.fetchone()
-            if ligne:
-                d = {}
-                for i in range(len(desc)):
-                    d[desc[i]] = ligne[i]
-
-                def to_float(v, defaut):
-                    try:
-                        if v is None:
-                            return defaut
-                        return float(str(v).replace(",", "."))
-                    except Exception:
-                        return defaut
-
-                if col_prix and col_prix in d:
-                    prix_moyen = to_float(d.get(col_prix), 1.0)
-                if col_prix_min and col_prix_min in d:
-                    prix_min = to_float(d.get(col_prix_min), None)
-                if col_prix_max and col_prix_max in d:
-                    prix_max = to_float(d.get(col_prix_max), None)
-                if col_quantite and col_quantite in d:
-                    quantite = to_float(d.get(col_quantite), 1.0)
-                if col_coef and col_coef in d:
-                    coefficient = to_float(d.get(col_coef), 1.0)
-
-    # Calcul valeur base
-    valeur_moy = prix_moyen * quantite * coefficient
-
-    # Si min/max absents, on les derive du moyen
-    if prix_min is None:
-        valeur_min = valeur_moy
-    else:
-        valeur_min = prix_min * quantite * coefficient
-
-    if prix_max is None:
-        valeur_max = valeur_moy
-    else:
-        valeur_max = prix_max * quantite * coefficient
-
-    return valeur_moy, valeur_min, valeur_max
-
-
-# ============================================================
-# Simulation deterministe
-# ============================================================
-def simuler(connexion, colonne_id, liste_objets_ids, impacts_objets, taux_annuel, nb_annees):
-    """
-    Calcule:
-    - total_moyen, total_min, total_max
-    - projection a N annees sur le total_moyen (taux simple)
-    """
-    total_moyen = 0.0
-    total_min = 0.0
-    total_max = 0.0
-
-    details = []  # liste lignes pour affichage (objet_id, base, facteur_evt, final)
-
-    for oid in liste_objets_ids:
-        base_moy, base_min, base_max = lire_valeurs_base_objet(connexion, colonne_id, oid)
-
-        somme_evt = impacts_objets.get(oid, 0.0)
-        facteur_evt = 1.0 + somme_evt
-
-        val_moy = base_moy * facteur_evt
-        val_min = base_min * facteur_evt
-        val_max = base_max * facteur_evt
-
-        total_moyen += val_moy
-        total_min += val_min
-        total_max += val_max
-
-        details.append((oid, base_moy, somme_evt, val_moy))
-
-    # Projection (deterministe simple)
-    if nb_annees < 0:
-        nb_annees = 0
-
+    cur = connexion.cursor()
     try:
-        taux = float(taux_annuel)
+        cur.execute("PRAGMA table_info(evenements)")
+        info_cols = cur.fetchall()
+        colonnes = [c[1] for c in info_cols]
     except Exception:
-        taux = 0.0
+        colonnes = []
 
-    total_proj = total_moyen * ((1.0 + taux) ** nb_annees)
+    if not colonnes:
+        return None
 
-    return total_moyen, total_min, total_max, total_proj, details
-
-
-# ============================================================
-# Contexte univers
-# ============================================================
-uid = lire_parametre_get("uid", "").strip()
-if not uid:
-    print("<h1>Erreur : univers non specifie</h1>")
-    raise SystemExit
-
-uid_encode = urllib.parse.quote(uid)
-nom_univers = recuperer_nom_univers(uid)
-
-chemin_bdd = construire_chemin_univers(uid)
-if not os.path.exists(chemin_bdd):
-    print("<h1>Erreur : BDD univers introuvable</h1>")
-    print("<p>Chemin attendu : " + echapper_html(chemin_bdd) + "</p>")
-    raise SystemExit
-
-connexion = sqlite3.connect(chemin_bdd)
-
-# Verifications minimales
-if not table_existe(connexion, "stat_objects"):
-    print("<h1>Erreur : table stat_objects introuvable</h1>")
-    connexion.close()
-    raise SystemExit
-
-colonne_id, colonne_nom = detecter_colonnes_stat_objects(connexion)
-if not colonne_id or not colonne_nom:
-    print("<h1>Erreur : stat_objects invalide</h1>")
-    connexion.close()
-    raise SystemExit
-
-
-# ============================================================
-# Parametres UI (sans JS)
-# ============================================================
-# Evenements actifs: "evt=1&evt=2..."
-evenements_actifs = []
-for key, vals in urllib.parse.parse_qs(os.environ.get("QUERY_STRING", ""), keep_blank_values=True).items():
-    if key == "evt":
-        for v in vals:
-            if str(v).isdigit():
-                evenements_actifs.append(int(v))
-
-# Horizon / taux
-nb_annees_str = lire_parametre_get("nb_annees", "5").strip()
-taux_str = lire_parametre_get("taux_annuel", "0.00").strip()
-
-try:
-    nb_annees = int(nb_annees_str)
-except Exception:
-    nb_annees = 5
-
-try:
-    taux_annuel = float(taux_str.replace(",", "."))
-except Exception:
-    taux_annuel = 0.0
-
-action = lire_parametre_get("action", "").strip()
-
-message_ok = ""
-message_erreur = ""
-
-# Liste evenements pour UI
-liste_evenements = []
-if table_existe(connexion, "evenements"):
+    # Construire requete SELECT avec toutes les colonnes presentes
+    cols_sql = ", ".join(["[{}]".format(c) for c in colonnes])
     try:
-        liste_evenements = lister_evenements(connexion, limite=200)
+        cur.execute("SELECT {} FROM evenements WHERE id = ?".format(cols_sql), (evenement_id,))
+        lig = cur.fetchone()
     except Exception:
-        liste_evenements = []
+        return None
 
-# Impacts agreges
-impacts_objets = {}
-if evenements_actifs and table_existe(connexion, "impacts_evenements"):
+    if not lig:
+        return None
+
+    evt = {}
+    for i, c in enumerate(colonnes):
+        evt[c] = lig[i]
+    return evt
+
+
+def lire_impacts_evenement(connexion, evenement_id):
+    """
+    Lit la table impacts_evenements (cree par liaison.py).
+    Retour:
+    - dict objet_id -> poids_final
+    """
+    cur = connexion.cursor()
     try:
-        impacts_objets = lire_impacts_evenements_actifs(connexion, evenements_actifs)
-    except Exception:
-        impacts_objets = {}
-
-# Liste des objets simules: pour une V1 simple, on prend tous les objets de stat_objects
-cur = connexion.cursor()
-cur.execute(f"SELECT [{colonne_id}] FROM stat_objects")
-liste_objets_ids = [int(r[0]) for r in cur.fetchall() if r and r[0] is not None]
-
-# Resultats simulation
-resultats = None
-
-if action == "calculer":
-    try:
-        total_moy, total_min, total_max, total_proj, details = simuler(
-            connexion,
-            colonne_id,
-            liste_objets_ids,
-            impacts_objets,
-            taux_annuel,
-            nb_annees
+        cur.execute(
+            "SELECT objet_id, poids_final FROM impacts_evenements WHERE evenement_id = ?",
+            (evenement_id,)
         )
-        resultats = (total_moy, total_min, total_max, total_proj, details)
-        message_ok = "Simulation calculee sur " + str(len(liste_objets_ids)) + " objet(s)."
-    except Exception as e:
-        message_erreur = "Erreur simulation : " + str(e)
+        d = {}
+        for oid, p in cur.fetchall():
+            d[oid] = _float_robuste(p, 1.0)
+        return d
+    except Exception:
+        return {}
+
+
+def _extraire_valeur_evt(evt, *noms_possibles, defaut=None):
+    """Extrait une valeur d un dict evt via plusieurs noms possibles."""
+    if not evt:
+        return defaut
+    # Essayer exact
+    for n in noms_possibles:
+        if n in evt:
+            return evt.get(n)
+    # Essayer en insensible a la casse
+    lower_map = {}
+    for k in evt.keys():
+        lower_map[str(k).lower()] = k
+    for n in noms_possibles:
+        kk = lower_map.get(str(n).lower())
+        if kk is not None:
+            return evt.get(kk)
+    return defaut
 
 
 # ============================================================
-# HTML / CSS (mystique privealy)
+# Etat interne d un objet pendant la simulation
 # ============================================================
-print(f"""
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="utf-8">
-<title>Simulation Calcule - {echapper_html(nom_univers)}</title>
 
-<style>
-body {{
-  margin: 0;
-  font-family: Arial, sans-serif;
-  color: #ffffff;
-  min-height: 100vh;
-  background:
-    radial-gradient(900px 600px at 18% 18%, rgba(255,216,106,0.12), rgba(0,0,0,0) 62%),
-    radial-gradient(800px 520px at 82% 18%, rgba(190,120,255,0.20), rgba(0,0,0,0) 60%),
-    radial-gradient(900px 650px at 55% 85%, rgba(110,255,220,0.06), rgba(0,0,0,0) 62%),
-    linear-gradient(180deg, #05020a 0%, #0b0615 45%, #120a22 100%);
-}}
-body:before {{
-  content:"";
-  position:fixed; top:0; left:0; right:0; bottom:0;
-  pointer-events:none;
-  background: radial-gradient(900px 500px at 50% 30%, rgba(255,255,255,0.04), rgba(0,0,0,0) 60%);
-  opacity:0.60;
-}}
-.bouton-retour {{
-  position: fixed;
-  top: 20px;
-  left: 20px;
-  width: 64px;
-  height: 64px;
-  background: url('/back_btn_violet.png') no-repeat center/contain;
-}}
-.panel {{
-  width: 1280px;
-  margin: 55px auto;
-  padding: 54px;
-  box-sizing: border-box;
-  border-radius: 30px;
-  background: rgba(14, 6, 26, 0.72);
-  border: 1px solid rgba(255,216,106,0.20);
-  box-shadow: 0 30px 70px rgba(0,0,0,0.62);
-}}
-h1 {{
-  margin: 0;
-  text-align: center;
-  color: #FFD86A;
-  letter-spacing: 0.8px;
-}}
-.ligne-univers {{
-  text-align: center;
-  margin-top: 10px;
-  font-size: 14px;
-  color: rgba(255,255,255,0.84);
-}}
-.message {{
-  margin: 18px 0 0 0;
-  padding: 12px 16px;
-  border-radius: 14px;
-  background: rgba(0,0,0,0.28);
-  border: 1px solid rgba(255,255,255,0.10);
-  font-size: 13px;
-}}
-.message.ok {{ border-color: rgba(120,255,180,0.30); }}
-.message.bad {{ border-color: rgba(255,120,120,0.30); }}
+def construire_etat_objets_initial(connexion, colonnes, ids_objets):
+    """
+    Construit un etat initial minimal:
+    etat[objet_id] = {
+      "nom": ...,
+      "prix_moyen": ...,
+      "prix_min": ...,
+      "prix_max": ...,
+      "ca": ...,
+      "famille": ...,
+      "type": ...,
+      "speculation": ...,
+      "taux_utilisation": ...,
+      "coef_aug_prev": ...
+    }
+    """
+    etat = {}
+    if not ids_objets:
+        return etat
 
-.grille {{
-  margin-top: 22px;
-  display: grid;
-  grid-template-columns: 0.9fr 1.1fr;
-  gap: 20px;
-}}
-.carte {{
-  border-radius: 24px;
-  padding: 22px;
-  box-sizing: border-box;
-  background:
-    radial-gradient(700px 260px at 20% 20%, rgba(255,216,106,0.06), rgba(0,0,0,0) 60%),
-    linear-gradient(180deg, rgba(70,28,120,0.58), rgba(45,16,85,0.58));
-  border: 1px solid rgba(255,255,255,0.10);
-  box-shadow: 0 18px 36px rgba(0,0,0,0.50);
-}}
-.carte h2 {{
-  margin: 0 0 12px 0;
-  font-size: 18px;
-}}
-.label {{
-  display:block;
-  margin: 10px 0 6px 0;
-  font-size: 12px;
-  opacity: 0.90;
-}}
-.champ-texte {{
-  width: 100%;
-  box-sizing: border-box;
-  padding: 12px;
-  border-radius: 14px;
-  background: rgba(0,0,0,0.28);
-  color: #ffffff;
-  border: 1px solid rgba(255,255,255,0.12);
-  outline: none;
-}}
-.ligne-actions {{
-  margin-top: 14px;
-  display:flex;
-  gap: 10px;
-  justify-content: flex-end;
-  align-items:center;
-  flex-wrap: wrap;
-}}
-.bouton {{
-  display:inline-block;
-  padding: 10px 18px;
-  border-radius: 999px;
-  text-decoration:none;
-  font-size: 13px;
-  cursor:pointer;
-  color: #FFD86A;
-  background: rgba(255,216,106,0.12);
-  border: 1px solid rgba(255,216,106,0.38);
-}}
-.bouton-secondaire {{
-  color: rgba(255,255,255,0.88);
-  background: rgba(255,255,255,0.08);
-  border: 1px solid rgba(255,255,255,0.14);
-}}
-.table {{
-  width: 100%;
-  border-collapse: collapse;
-  margin-top: 10px;
-  font-size: 13px;
-}}
-.table th, .table td {{
-  text-align:left;
-  padding: 10px 8px;
-  border-bottom: 1px solid rgba(255,255,255,0.08);
-  vertical-align: top;
-}}
-.petit {{
-  font-size: 12px;
-  opacity: 0.82;
-}}
-</style>
-</head>
+    # Requete par id, avec colonnes disponibles
+    placeholders = ",".join(["?"] * len(ids_objets))
 
-<body>
-<a class="bouton-retour" href="/cgi-bin/menu_simulation.py?uid={uid_encode}" title="Retour"></a>
+    champs = []
+    for cle in ["id", "nom", "prix_moyen", "prix_min", "prix_max", "ca", "famille", "type", "speculation", "taux_utilisation", "coef_aug_prev"]:
+        if colonnes.get(cle):
+            champs.append("[{}]".format(colonnes[cle]))
 
-<div class="panel">
-  <h1>Simulation Calcule</h1>
-  <div class="ligne-univers">
-    Univers : <strong>{echapper_html(nom_univers)}</strong> &nbsp;|&nbsp; ID : {echapper_html(uid)}
-  </div>
-""")
+    if not champs or not colonnes.get("id"):
+        return etat
 
-if message_ok:
-    print(f'<div class="message ok">{echapper_html(message_ok)}</div>')
-if message_erreur:
-    print(f'<div class="message bad">{echapper_html(message_erreur)}</div>')
+    cur = connexion.cursor()
+    requete = "SELECT {} FROM stat_objects WHERE [{}] IN ({})".format(
+        ", ".join(champs),
+        colonnes["id"],
+        placeholders
+    )
+    cur.execute(requete, tuple(ids_objets))
+    lignes = cur.fetchall()
 
-print(f"""
-  <div class="grille">
-    <div class="carte">
-      <h2>Parametres</h2>
+    # Indices utiles: on reconstruit a partir de "champs"
+    # Exemple: champs = ["[id]","[Objet]","[Prix_Moyen_Actuel]"]
+    champs_net = [c.strip("[]") for c in champs]
 
-      <form method="get" action="/cgi-bin/sim_calc.py">
-        <input type="hidden" name="uid" value="{echapper_html(uid)}">
+    for lig in lignes:
+        d = {}
+        for i, nom_col in enumerate(champs_net):
+            d[nom_col] = lig[i]
 
-        <label class="label">Horizon (annees)</label>
-        <input class="champ-texte" type="text" name="nb_annees" value="{echapper_html(nb_annees_str)}">
+        # Recuperer l id
+        objet_id = None
+        try:
+            objet_id = d.get(colonnes["id"])
+        except Exception:
+            objet_id = None
 
-        <label class="label">Taux annuel (ex: 0.05 = 5%)</label>
-        <input class="champ-texte" type="text" name="taux_annuel" value="{echapper_html(taux_str)}">
+        if objet_id is None:
+            continue
 
-        <h2 style="margin-top:16px;">Evenements actifs</h2>
-""")
+        # Recuperer valeurs connues (fallback 0.0)
+        nom = d.get(colonnes["nom"]) if colonnes.get("nom") else ""
+        prix_moyen = _float_robuste(d.get(colonnes["prix_moyen"]), 0.0) if colonnes.get("prix_moyen") else 0.0
+        prix_min = _float_robuste(d.get(colonnes["prix_min"]), prix_moyen) if colonnes.get("prix_min") else prix_moyen
+        prix_max = _float_robuste(d.get(colonnes["prix_max"]), prix_moyen) if colonnes.get("prix_max") else prix_moyen
+        ca = _float_robuste(d.get(colonnes["ca"]), 0.0) if colonnes.get("ca") else 0.0
 
-# Liste checkbox evenements (sans JS)
-if not liste_evenements:
-    print('<div class="message">Aucun evenement (cree-les dans Liaison).</div>')
-else:
-    for (eid, nom_evt, pg, it, du, pr, tg, dc) in liste_evenements:
-        coche = "checked" if eid in evenements_actifs else ""
-        print(f"""
-          <label class="petit" style="display:block; margin-top:8px;">
-            <input type="checkbox" name="evt" value="{eid}" {coche}>
-            {echapper_html(nom_evt)} <span class="petit">(# {eid})</span>
-          </label>
-        """)
+        famille = d.get(colonnes["famille"]) if colonnes.get("famille") else ""
+        type_obj = d.get(colonnes["type"]) if colonnes.get("type") else ""
+        speculation = d.get(colonnes["speculation"]) if colonnes.get("speculation") else ""
+        taux_util = d.get(colonnes["taux_utilisation"]) if colonnes.get("taux_utilisation") else ""
+        coef_aug = _float_robuste(d.get(colonnes["coef_aug_prev"]), 1.02) if colonnes.get("coef_aug_prev") else 1.02
 
-print("""
-        <div class="ligne-actions">
-          <button class="bouton" type="submit" name="action" value="calculer">Calculer</button>
-          <a class="bouton bouton-secondaire" href="#">(Beta)</a>
-        </div>
-      </form>
-    </div>
+        etat[int(objet_id)] = {
+            "nom": "" if nom is None else str(nom),
+            "prix_moyen": prix_moyen,
+            "prix_min": prix_min,
+            "prix_max": prix_max,
+            "ca": ca,
+            "famille": "" if famille is None else str(famille),
+            "type": "" if type_obj is None else str(type_obj),
+            "speculation": "" if speculation is None else str(speculation),
+            "taux_utilisation": "" if taux_util is None else str(taux_util),
+            "coef_aug_prev": coef_aug
+        }
 
-    <div class="carte">
-      <h2>Resultats</h2>
-""")
+    return etat
 
-if resultats is None:
-    print('<div class="message">Lance "Calculer" pour obtenir un resultat.</div>')
-else:
-    total_moy, total_min, total_max, total_proj, details = resultats
 
-    print(f"""
-      <div class="message ok">
-        <strong>Total moyen:</strong> {echapper_html(round(total_moy, 6))}<br>
-        <strong>Total min:</strong> {echapper_html(round(total_min, 6))}<br>
-        <strong>Total max:</strong> {echapper_html(round(total_max, 6))}<br>
-        <strong>Projection a {echapper_html(nb_annees)} an(s):</strong> {echapper_html(round(total_proj, 6))}
-      </div>
-    """)
+# ============================================================
+# Base evolution annuelle (hors evenements)
+# ============================================================
 
-    # Tableau details (limite pour rester lisible)
-    print('<div class="message" style="margin-top:12px;">Details (limite 80 lignes)</div>')
-    print('<table class="table">')
-    print('<tr><th>Objet</th><th>Base</th><th>Somme evt</th><th>Final</th></tr>')
+def appliquer_croissance_annuelle(etat_objet):
+    """
+    Applique une croissance simple:
+    - prix: via coef_aug_prev + facteurs spec/util si dispo
+    - ca: petite croissance defaut
+    """
+    if not etat_objet:
+        return
 
-    # On affiche les plus "forts" (final)
-    details_trie = sorted(details, key=lambda x: -x[3])
-    for (oid, base, somme_evt, final) in details_trie[:80]:
-        # Nom objet
-        cur = connexion.cursor()
-        cur.execute(f"SELECT [{colonne_nom}] FROM stat_objects WHERE [{colonne_id}] = ?", (oid,))
-        r = cur.fetchone()
-        nom_obj = r[0] if r and r[0] is not None else ""
-        print(f"""
-          <tr>
-            <td>{echapper_html(nom_obj)} <span class="petit">(# {echapper_html(oid)})</span></td>
-            <td>{echapper_html(round(base, 6))}</td>
-            <td>{echapper_html(round(somme_evt, 6))}</td>
-            <td>{echapper_html(round(final, 6))}</td>
-          </tr>
-        """)
+    coef = _float_robuste(etat_objet.get("coef_aug_prev"), 1.02)
 
-    print("</table>")
+    # Facteurs "soft"
+    fs = facteur_speculation(etat_objet.get("speculation"))
+    fu = facteur_utilisation(etat_objet.get("taux_utilisation"))
 
-print("""
-    </div>
-  </div>
-</div>
-</body>
-</html>
-""")
+    # Coefficient annuel final (defaut 1.02)
+    coef_final = coef * fs * fu
+    if coef_final <= 0:
+        coef_final = 1.0
 
-connexion.close()
+    # Prix
+    etat_objet["prix_moyen"] = max(0.0, etat_objet.get("prix_moyen", 0.0) * coef_final)
+    etat_objet["prix_min"] = max(0.0, etat_objet.get("prix_min", 0.0) * coef_final)
+    etat_objet["prix_max"] = max(0.0, etat_objet.get("prix_max", 0.0) * coef_final)
+
+    # CA (defaut)
+    ca = _float_robuste(etat_objet.get("ca"), 0.0)
+    etat_objet["ca"] = max(0.0, ca * (1.0 + TAUX_CA_DEFAUT))
+
+
+# ============================================================
+# Application d un evenement parametrie (Ep) sur l etat
+# ============================================================
+
+def appliquer_evenement_parametrique(
+    etat,
+    evenement,
+    impacts,
+    propagation,
+    coef_prix=1.0,
+    coef_ca=1.0
+):
+    """
+    Applique un evenement parametrie.
+    - impacts: dict objet_id -> poids_final (table impacts_evenements)
+    - propagation: dict objet_id -> (niveau, poids_reseau) (liaisons)
+    - coef_prix / coef_ca: coefficients globaux (ex: 0.9 => -10%)
+
+    Strategie "safe":
+    - Pour chaque objet impacte:
+        coef_local = 1 + (coef_global - 1) * poids_total
+      avec poids_total = poids_final * poids_reseau
+      (poids_reseau = 1 si pas dans la propagation)
+    """
+    if not etat or not evenement:
+        return
+
+    # Si pas d impacts, rien a appliquer
+    if not impacts:
+        return
+
+    for oid, poids_impact in impacts.items():
+        if oid not in etat:
+            # Si l objet n est pas dans la projection, on ignore (on reste deterministe)
+            continue
+
+        # Poids reseau (liaison): si l objet est proche des objets de depart, il est plus affecte
+        poids_reseau = 1.0
+        if propagation and oid in propagation:
+            poids_reseau = _float_robuste(propagation[oid][1], 1.0)
+
+        poids_total = _float_robuste(poids_impact, 1.0) * poids_reseau
+        if poids_total < 0.0:
+            poids_total = 0.0
+        if poids_total > 1.0:
+            # On limite pour eviter des delires
+            poids_total = 1.0
+
+        # Coeff local prix / ca
+        coef_local_prix = 1.0 + (coef_prix - 1.0) * poids_total
+        coef_local_ca = 1.0 + (coef_ca - 1.0) * poids_total
+
+        # Appliquer a l etat
+        etat[oid]["prix_moyen"] = max(0.0, etat[oid]["prix_moyen"] * coef_local_prix)
+        etat[oid]["prix_min"] = max(0.0, etat[oid]["prix_min"] * coef_local_prix)
+        etat[oid]["prix_max"] = max(0.0, etat[oid]["prix_max"] * coef_local_prix)
+        etat[oid]["ca"] = max(0.0, etat[oid]["ca"] * coef_local_ca)
+
+
+# ============================================================
+# Simulation principale
+# ============================================================
+
+def executer_simulation(
+    connexion,
+    ids_projection,
+    nb_annees,
+    annee_depart,
+    planning_evenements
+):
+    """
+    Execute la simulation deterministe.
+
+    Parametres:
+    - ids_projection: liste d ids d objets a projeter
+    - nb_annees: nombre d annees (ex: 10)
+    - annee_depart: annee de depart (ex: 2026)
+    - planning_evenements: liste de tuples (annee_relative, evenement_id, coef_prix, coef_ca)
+
+      annee_relative:
+        - 0 => arrive a annee_depart
+        - 1 => arrive annee_depart+1
+        etc.
+
+      coef_prix / coef_ca:
+        - 1.0 => aucun effet
+        - 0.9 => -10%
+        - 1.2 => +20%
+
+    Retour:
+    - resultats: dict
+        {
+          "annees": [annee1, annee2, ...],
+          "prix_moyen_total": [..],
+          "ca_total": [..],
+          "details_objets": { objet_id: { "nom":..., "prix": [(annee,val)], "ca":[...] } }
+        }
+    """
+    colonnes = detecter_colonnes_statistiques(connexion)
+
+    # Securite basique: si id/nom manquent -> simulation impossible
+    if not colonnes.get("id") or not colonnes.get("nom"):
+        return None
+
+    # Normaliser parametres
+    nb_annees = _int_robuste(nb_annees, 1)
+    if nb_annees < 1:
+        nb_annees = 1
+    if nb_annees > 80:
+        nb_annees = 80
+
+    annee_depart = _int_robuste(annee_depart, 2026)
+
+    # Construire etat initial
+    etat = construire_etat_objets_initial(connexion, colonnes, ids_projection)
+
+    # Si rien charge, retour vide
+    if not etat:
+        return {
+            "annees": [],
+            "prix_moyen_total": [],
+            "ca_total": [],
+            "details_objets": {}
+        }
+
+    # Preparer structure de sortie par objet
+    details_objets = {}
+    for oid, d in etat.items():
+        details_objets[oid] = {
+            "nom": d.get("nom", ""),
+            "prix": [],
+            "ca": []
+        }
+
+    # Preparer planning: index par annee_relative
+    planning_index = {}
+    for (ar, eid, cp, cc) in (planning_evenements or []):
+        ar = _int_robuste(ar, 0)
+        eid = _int_robuste(eid, 0)
+        if eid <= 0:
+            continue
+        # Une annee peut avoir plusieurs evenements
+        planning_index.setdefault(ar, []).append((eid, _float_robuste(cp, 1.0), _float_robuste(cc, 1.0)))
+
+    # Sorties globales
+    annees = []
+    prix_moyen_total = []
+    ca_total = []
+
+    # Boucle annees
+    for pas in range(0, nb_annees + 1):
+        annee = annee_depart + pas
+
+        # 1) appliquer croissance annuelle (sauf a pas=0, on veut l etat "initial")
+        if pas > 0:
+            for oid in etat.keys():
+                appliquer_croissance_annuelle(etat[oid])
+
+        # 2) appliquer evenements prevus cette annee
+        if pas in planning_index:
+            for (eid, coef_prix, coef_ca) in planning_index[pas]:
+                evt = lire_evenement(connexion, eid)
+                impacts = lire_impacts_evenement(connexion, eid)
+
+                # Si l utilisateur a lie l evenement a une selection, on propage depuis les "objets touches"
+                # Dans impacts_evenements, les objets niveau 0 sont deja dedans, mais on veut aussi tenir compte du reseau
+                objets_depart = list(impacts.keys())
+                propagation = calculer_propagation_reseau(connexion, objets_depart)
+
+                # Appliquer evenement parametrie (Ep)
+                appliquer_evenement_parametrique(
+                    etat=etat,
+                    evenement=evt,
+                    impacts=impacts,
+                    propagation=propagation,
+                    coef_prix=coef_prix,
+                    coef_ca=coef_ca
+                )
+
+        # 3) enregistrer courbes
+        annees.append(annee)
+
+        total_prix = 0.0
+        total_ca = 0.0
+        for oid, d in etat.items():
+            p = _float_robuste(d.get("prix_moyen"), 0.0)
+            c = _float_robuste(d.get("ca"), 0.0)
+            total_prix += p
+            total_ca += c
+
+            details_objets[oid]["prix"].append((annee, round(p, 2)))
+            details_objets[oid]["ca"].append((annee, round(c, 2)))
+
+        prix_moyen_total.append(round(total_prix, 2))
+        ca_total.append(round(total_ca, 2))
+
+    return {
+        "annees": annees,
+        "prix_moyen_total": prix_moyen_total,
+        "ca_total": ca_total,
+        "details_objets": details_objets
+    }

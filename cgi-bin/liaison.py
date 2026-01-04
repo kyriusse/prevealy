@@ -4,74 +4,117 @@
 """
 liaison.py
 ----------
-PAGE "LIAISON" (univers)
+PAGE "LIAISON / RESEAUX" (univers)
 
-Objectif simple:
-- ETAPE 1: construire un reseau (objets lies entre eux)
-- ETAPE 2: creer un evenement qui impacte une selection
-          -> propagation automatique sur tout le reseau
+Objectif (version "chef d'oeuvre NSI" mais simple a utiliser):
+- Creer des liaisons entre "applicables" du meme type:
+  - Type O: objets (table stat_objects)
+  - Type E: evenements (table evenements, creee ici; evenement.py l'alimentera plus tard)
+- Organiser automatiquement ces liaisons en RESEAUX (R1, R2, ...), stockes en base:
+  - Un reseau = un groupe de liaisons connectees (composantes connexes)
+  - Quand on ajoute une liaison, on:
+      * cree un nouveau reseau si besoin
+      * ou on etend un reseau existant
+      * ou on fusionne 2 reseaux si la liaison relie 2 groupes differents
+- Voir les reseaux sous forme "lisible" (texte) pour preparer la simulation.
 
 Contraintes:
-- Sans JavaScript (formulaires GET + reload)
-- Variables en francais
-- Commentaires partout (sauf evidences)
+- CGI sans JavaScript (GET + reload)
+- Variables / fonctions en francais
+- Beaucoup de commentaires
+- Donnees exploitables plus tard dans simulation (tables propres, champs stables)
+
+Note architecture importante:
+- La page "liaison" NE DECLENCHE RIEN.
+- Elle construit uniquement la structure (reseaux + liaisons).
+- L'execution / propagation / calculs seront faits plus tard dans les pages de simulation.
 """
 
 import os
 import sqlite3
 import urllib.parse
 import html
-import difflib
+import datetime
 
 
 # ============================================================
-# En-tete CGI obligatoire
+# En-tete CGI obligatoire (sinon page blanche)
 # ============================================================
 print("Content-Type: text/html; charset=utf-8\n")
 
 
 # ============================================================
-# Constantes
+# Constantes projet
 # ============================================================
-DOSSIER_UNIVERS = "cgi-bin/universes/"
+DOSSIER_UNIVERS = "cgi-bin/universes/"  # Dossier contenant les BDD des univers
 
 
 # ============================================================
-# Utils: lire parametre GET
+# Utils: securite / params / format
 # ============================================================
 def lire_parametre_get(nom, defaut=""):
-    """Retourne la valeur GET (?nom=...) ou defaut si absent."""
+    """
+    Lire un parametre GET (?nom=...).
+    - keep_blank_values=True: permet de recuperer les champs vides
+    """
     query_string = os.environ.get("QUERY_STRING", "")
-    parametres = urllib.parse.parse_qs(query_string, keep_blank_values=True)
-    return parametres.get(nom, [defaut])[0]
+    params = urllib.parse.parse_qs(query_string, keep_blank_values=True)
+    return params.get(nom, [defaut])[0]
 
 
-# ============================================================
-# Utils: echappement HTML
-# ============================================================
 def echapper_html(texte):
-    """Echappe un texte pour eviter d'injecter du HTML."""
+    """Echappement HTML (anti-injection)."""
     return html.escape("" if texte is None else str(texte))
 
 
+def encoder_url(texte):
+    """Encodage URL (pour reinjecter des valeurs dans des liens)."""
+    return urllib.parse.quote("" if texte is None else str(texte))
+
+
+def ids_depuis_chaine(chaine):
+    """Transformer '1,2,3' -> [1,2,3] en eliminant doublons."""
+    resultat = []
+    for morceau in (chaine or "").split(","):
+        morceau = morceau.strip()
+        if morceau.isdigit():
+            v = int(morceau)
+            if v not in resultat:
+                resultat.append(v)
+    return resultat
+
+
+def chaine_depuis_ids(liste_ids):
+    """Transformer [1,2,3] -> '1,2,3'."""
+    return ",".join([str(x) for x in (liste_ids or [])])
+
+
+def maintenant_texte():
+    """Retourne un timestamp lisible (debug / affichage)."""
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 # ============================================================
-# Utils: chemin BDD univers
+# Utils: univers (chemin + nom)
 # ============================================================
 def construire_chemin_univers(uid):
-    """Construit le chemin de BDD univers avec uid nettoye."""
+    """
+    Construit le chemin vers la BDD univers.
+    Protection: on filtre uid pour empecher de viser un autre fichier via des caracteres bizarres.
+    """
     uid_sain = "".join([c for c in uid if c.isalnum() or c in ("-", "_")])
     return os.path.join(DOSSIER_UNIVERS, "universe_" + uid_sain + ".db")
 
 
-# ============================================================
-# Utils: nom univers
-# ============================================================
 def recuperer_nom_univers(uid):
-    """Lit univers_names.txt et renvoie le nom correspondant."""
+    """
+    Lit univers_names.txt (format: uid,nom).
+    Renvoie "Nom inconnu" si absent.
+    """
     try:
-        chemin_fichier = os.path.join(DOSSIER_UNIVERS, "univers_names.txt")
-        if os.path.exists(chemin_fichier):
-            with open(chemin_fichier, "r", encoding="utf-8") as f:
+        chemin_noms = os.path.join(DOSSIER_UNIVERS, "univers_names.txt")
+        if os.path.exists(chemin_noms):
+            with open(chemin_noms, "r", encoding="utf-8") as f:
                 for ligne in f:
                     if "," in ligne:
                         uid_lu, nom_lu = ligne.strip().split(",", 1)
@@ -83,10 +126,15 @@ def recuperer_nom_univers(uid):
 
 
 # ============================================================
-# Utils: detecter colonnes stat_objects (id + Objet)
+# BDD: detection colonnes stat_objects (id + Objet)
 # ============================================================
 def detecter_colonnes_stat_objects(connexion):
-    """Detecte les colonnes clefs de stat_objects."""
+    """
+    Detecter les colonnes principales de stat_objects:
+    - colonne_id: idealement "id"
+    - colonne_nom: idealement "Objet"
+    Fallback: si les noms ne matchent pas, on prend les 2 premieres colonnes.
+    """
     cur = connexion.cursor()
     cur.execute("PRAGMA table_info(stat_objects)")
     infos = cur.fetchall()
@@ -102,7 +150,6 @@ def detecter_colonnes_stat_objects(connexion):
         elif nom_min == "objet":
             colonne_nom = nom_col
 
-    # Fallbacks si structure differente
     if colonne_id is None and infos:
         colonne_id = infos[0][1]
     if colonne_nom is None and len(infos) >= 2:
@@ -112,64 +159,85 @@ def detecter_colonnes_stat_objects(connexion):
 
 
 # ============================================================
-# Tables monde
+# BDD: creation tables (evenements + reseaux + liaisons)
 # ============================================================
-def creer_tables_monde_si_besoin(connexion):
-    """Cree les tables reseau + evenements + impacts si elles n'existent pas."""
+def creer_tables_si_besoin(connexion):
+    """
+    Tables creees ici car univers db peut etre vide au debut.
+
+    1) evenements:
+       - evenement.py alimentera plus tard
+       - ici on a juste de quoi les lister / lier
+
+    2) reseaux_applicables:
+       - un reseau = un groupe de liaisons connectees
+       - un reseau a un type ('O' ou 'E') pour separer objets/evenements
+
+    3) liaisons_applicables:
+       - stocke chaque liaison
+       - reseau_id permet de regrouper / retrouver vite les reseaux
+       - implication ('->' ou '<->') definit la direction
+       - precision (type_lien, poids, commentaire) est optionnelle
+    """
     cur = connexion.cursor()
 
-    # Graphe objet <-> objet
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS liaisons_objets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source_objet_id INTEGER NOT NULL,
-            cible_objet_id INTEGER NOT NULL,
-            type_lien TEXT NOT NULL DEFAULT 'associe',
-            poids REAL NOT NULL DEFAULT 1.0,
-            commentaire TEXT NOT NULL DEFAULT '',
-            date_creation TEXT DEFAULT (datetime('now'))
-        )
-    """)
-
-    # Definition evenements
+    # Table evenements (minimaliste, stable pour futur)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS evenements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nom TEXT NOT NULL,
-            poids_global REAL NOT NULL DEFAULT 1.0,
-            intensite REAL NOT NULL DEFAULT 1.0,
-            duree INTEGER NOT NULL DEFAULT 1,
-            probabilite REAL NOT NULL DEFAULT 1.0,
-            tags TEXT NOT NULL DEFAULT '',
+            type_evenement TEXT NOT NULL DEFAULT 'E',  -- E, Ec, Ep, Ea plus tard
+            definir_comme_E INTEGER NOT NULL DEFAULT 1, -- 1 = visible en simulation
             description TEXT NOT NULL DEFAULT '',
             date_creation TEXT DEFAULT (datetime('now'))
         )
     """)
 
-    # Impacts calcules d'un evenement sur le graphe (propagation)
+    # Table reseaux
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS impacts_evenements (
+        CREATE TABLE IF NOT EXISTS reseaux_applicables (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            evenement_id INTEGER NOT NULL,
-            objet_id INTEGER NOT NULL,
-            niveau INTEGER NOT NULL DEFAULT 0,
-            poids_final REAL NOT NULL DEFAULT 1.0,
-            role TEXT NOT NULL DEFAULT 'impacte',
-            origine TEXT NOT NULL DEFAULT 'direct',
-            commentaire TEXT NOT NULL DEFAULT '',
-            date_creation TEXT DEFAULT (datetime('now')),
-            UNIQUE(evenement_id, objet_id)
+            type_applicable TEXT NOT NULL,             -- 'O' ou 'E'
+            nom TEXT NOT NULL DEFAULT '',              -- optionnel (ex: "R1 - Economie")
+            date_creation TEXT DEFAULT (datetime('now'))
         )
     """)
+
+    # Table liaisons
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS liaisons_applicables (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            type_applicable TEXT NOT NULL,             -- 'O' ou 'E'
+            reseau_id INTEGER NOT NULL,                -- cle de regroupement
+
+            source_id INTEGER NOT NULL,
+            cible_id INTEGER NOT NULL,
+
+            implication TEXT NOT NULL DEFAULT '->',     -- '->' (implication) / '<->' (equivalence)
+
+            -- Precision optionnelle (si non maitrise, laisser valeurs par defaut)
+            type_lien TEXT NOT NULL DEFAULT 'associe',  -- associe / depend / compose / etc.
+            poids REAL NOT NULL DEFAULT 1.0,            -- coefficient de force (simulation plus tard)
+            commentaire TEXT NOT NULL DEFAULT '',
+
+            date_creation TEXT DEFAULT (datetime('now'))
+        )
+    """)
+
+    # Index utiles (performance + futures simulations)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_liaisons_type_reseau ON liaisons_applicables(type_applicable, reseau_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_liaisons_source ON liaisons_applicables(type_applicable, source_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_liaisons_cible ON liaisons_applicables(type_applicable, cible_id)")
 
     connexion.commit()
 
 
 # ============================================================
-# Utils: objets
+# BDD: objets (recherche + nom)
 # ============================================================
 def rechercher_objets(connexion, colonne_id, colonne_nom, texte, limite=25):
-    """Recherche simple (LIKE) dans stat_objects."""
+    """Recherche LIKE sur le nom d'objet dans stat_objects."""
     cur = connexion.cursor()
     motif = "%" + (texte or "").strip() + "%"
     cur.execute(
@@ -187,262 +255,328 @@ def rechercher_objets(connexion, colonne_id, colonne_nom, texte, limite=25):
     return cur.fetchall()
 
 
-def recuperer_nom_objet(connexion, colonne_id, colonne_nom, objet_id):
-    """Retourne le nom d'un objet (ou vide si introuvable)."""
+def nom_objet_par_id(connexion, colonne_id, colonne_nom, objet_id):
+    """Nom d'un objet via id."""
     cur = connexion.cursor()
-    cur.execute(
-        f"SELECT [{colonne_nom}] FROM stat_objects WHERE [{colonne_id}] = ?",
-        (objet_id,)
-    )
-    ligne = cur.fetchone()
-    return ligne[0] if ligne and ligne[0] is not None else ""
+    cur.execute(f"SELECT [{colonne_nom}] FROM stat_objects WHERE [{colonne_id}] = ?", (objet_id,))
+    row = cur.fetchone()
+    return row[0] if row and row[0] is not None else ""
 
 
-def recuperer_tous_les_noms(connexion, colonne_nom):
-    """Liste tous les noms (pour suggestions)."""
+# ============================================================
+# BDD: evenements (recherche + nom)
+# ============================================================
+def rechercher_evenements(connexion, texte, limite=25):
+    """Recherche LIKE sur le nom d'evenement."""
     cur = connexion.cursor()
-    cur.execute(
-        f"""
-        SELECT [{colonne_nom}]
-        FROM stat_objects
-        WHERE [{colonne_nom}] IS NOT NULL
-          AND TRIM([{colonne_nom}]) != ''
-        """
-    )
-    return [r[0] for r in cur.fetchall()]
-
-
-def suggestions_mot_proche(texte, noms, max_suggestions=8):
-    """Suggestions proches, ex: stylode -> stylo."""
-    if not texte:
-        return []
-    return difflib.get_close_matches(texte, noms, n=max_suggestions, cutoff=0.60)
-
-
-# ============================================================
-# Utils: IDs selection (GET)
-# ============================================================
-def ids_depuis_chaine(chaine):
-    """Transforme '1,2,3' -> [1,2,3]."""
-    resultat = []
-    for morceau in (chaine or "").split(","):
-        morceau = morceau.strip()
-        if morceau.isdigit():
-            v = int(morceau)
-            if v not in resultat:
-                resultat.append(v)
-    return resultat
-
-
-def chaine_depuis_ids(liste_ids):
-    """Transforme [1,2,3] -> '1,2,3'."""
-    return ",".join([str(x) for x in (liste_ids or [])])
-
-
-# ============================================================
-# Utils: reseau (liaisons)
-# ============================================================
-def ajouter_liaison_objets(connexion, source_id, cible_id, type_lien, poids, commentaire, symetrique=True):
-    """Ajoute liaison source->cible, et aussi cible->source si symetrique."""
-    cur = connexion.cursor()
-
+    motif = "%" + (texte or "").strip() + "%"
     cur.execute(
         """
-        INSERT INTO liaisons_objets (source_objet_id, cible_objet_id, type_lien, poids, commentaire)
-        VALUES (?, ?, ?, ?, ?)
+        SELECT id, nom, type_evenement
+        FROM evenements
+        WHERE nom IS NOT NULL
+          AND TRIM(nom) != ''
+          AND nom LIKE ?
+        ORDER BY nom COLLATE NOCASE
+        LIMIT ?
         """,
-        (source_id, cible_id, type_lien, poids, commentaire)
-    )
-
-    if symetrique:
-        cur.execute(
-            """
-            INSERT INTO liaisons_objets (source_objet_id, cible_objet_id, type_lien, poids, commentaire)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (cible_id, source_id, type_lien, poids, commentaire)
-        )
-
-    connexion.commit()
-
-
-def lister_liaisons_objets(connexion, source_id):
-    """Liste liaisons sortantes d'un objet source."""
-    cur = connexion.cursor()
-    cur.execute(
-        """
-        SELECT id, cible_objet_id, type_lien, poids, commentaire, date_creation
-        FROM liaisons_objets
-        WHERE source_objet_id = ?
-        ORDER BY id DESC
-        """,
-        (source_id,)
+        (motif, limite)
     )
     return cur.fetchall()
 
 
-def supprimer_liaison_objets(connexion, liaison_id):
-    """Supprime une ligne de liaison."""
+def nom_evenement_par_id(connexion, evenement_id):
+    """Nom d'un evenement via id."""
     cur = connexion.cursor()
-    cur.execute("DELETE FROM liaisons_objets WHERE id = ?", (liaison_id,))
-    connexion.commit()
-
-
-def voisins_objet(connexion, objet_id):
-    """Retourne les voisins directs (niveau 1)."""
-    cur = connexion.cursor()
-    cur.execute(
-        "SELECT cible_objet_id FROM liaisons_objets WHERE source_objet_id = ?",
-        (objet_id,)
-    )
-    return [r[0] for r in cur.fetchall()]
+    cur.execute("SELECT nom FROM evenements WHERE id = ?", (evenement_id,))
+    row = cur.fetchone()
+    return row[0] if row and row[0] is not None else ""
 
 
 # ============================================================
-# Utils: evenements + impacts
+# BDD: reseaux (creation / detection / fusion)
 # ============================================================
-def creer_evenement(connexion, nom, poids_global, intensite, duree, probabilite, tags, description):
-    """Cree un evenement et renvoie son id."""
+def creer_reseau(connexion, type_applicable):
+    """Creer un reseau et renvoyer son id."""
     cur = connexion.cursor()
-    cur.execute(
-        """
-        INSERT INTO evenements (nom, poids_global, intensite, duree, probabilite, tags, description)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (nom, poids_global, intensite, duree, probabilite, tags, description)
-    )
+    cur.execute("INSERT INTO reseaux_applicables (type_applicable, nom) VALUES (?, ?)", (type_applicable, ""))
     connexion.commit()
     return cur.lastrowid
 
 
-def lister_evenements(connexion, limite=80):
-    """Liste les evenements recents."""
+def reseaux_pour_element(connexion, type_applicable, element_id):
+    """
+    Retourne la liste des reseau_id qui contiennent element_id.
+    - element_id apparait soit en source_id soit en cible_id.
+    Normalement, un element devrait se retrouver dans 0 ou 1 reseau,
+    mais on reste robuste au cas ou.
+    """
     cur = connexion.cursor()
     cur.execute(
         """
-        SELECT id, nom, poids_global, intensite, duree, probabilite, tags, date_creation
-        FROM evenements
+        SELECT DISTINCT reseau_id
+        FROM liaisons_applicables
+        WHERE type_applicable = ?
+          AND (source_id = ? OR cible_id = ?)
+        """,
+        (type_applicable, element_id, element_id)
+    )
+    return [r[0] for r in cur.fetchall()]
+
+
+def fusionner_reseaux(connexion, type_applicable, reseau_garde, reseau_supprime):
+    """
+    Fusion:
+    - on met toutes les liaisons de reseau_supprime dans reseau_garde
+    - on supprime la ligne reseau_supprime (propre)
+    """
+    cur = connexion.cursor()
+
+    # Mise a jour des liaisons
+    cur.execute(
+        """
+        UPDATE liaisons_applicables
+        SET reseau_id = ?
+        WHERE type_applicable = ? AND reseau_id = ?
+        """,
+        (reseau_garde, type_applicable, reseau_supprime)
+    )
+
+    # Suppression du reseau "vide" (ou devenu inutile)
+    cur.execute(
+        "DELETE FROM reseaux_applicables WHERE id = ? AND type_applicable = ?",
+        (reseau_supprime, type_applicable)
+    )
+
+    connexion.commit()
+
+
+def choisir_reseau_pour_nouvelle_liaison(connexion, type_applicable, source_id, cible_id):
+    """
+    Determine le reseau_id a utiliser lors de l'insertion d'une nouvelle liaison.
+
+    Cas:
+    - Aucun des deux n'est dans un reseau -> creer un nouveau reseau
+    - Un seul est dans un reseau -> reutiliser ce reseau
+    - Les deux sont dans des reseaux differents -> fusionner
+    """
+    reseaux_source = reseaux_pour_element(connexion, type_applicable, source_id)
+    reseaux_cible = reseaux_pour_element(connexion, type_applicable, cible_id)
+
+    # On prend des ensembles pour simplifier
+    set_source = set(reseaux_source)
+    set_cible = set(reseaux_cible)
+    union = set_source.union(set_cible)
+
+    if not union:
+        # Aucun reseau existant -> nouveau
+        return creer_reseau(connexion, type_applicable)
+
+    if len(union) == 1:
+        # Meme reseau (ou un seul cote)
+        return list(union)[0]
+
+    # Plusieurs reseaux -> fusion en gardant le plus petit id (choix stable)
+    reseau_garde = min(union)
+    for r in sorted(union):
+        if r != reseau_garde:
+            fusionner_reseaux(connexion, type_applicable, reseau_garde, r)
+
+    return reseau_garde
+
+
+# ============================================================
+# BDD: liaisons (insert / delete / list)
+# ============================================================
+def inserer_liaison(connexion, type_applicable, reseau_id, source_id, cible_id,
+                    implication, type_lien, poids, commentaire):
+    """Insertion d'une liaison (simple) dans le reseau cible."""
+    cur = connexion.cursor()
+    cur.execute(
+        """
+        INSERT INTO liaisons_applicables (
+            type_applicable, reseau_id,
+            source_id, cible_id,
+            implication, type_lien, poids, commentaire
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (type_applicable, reseau_id, source_id, cible_id, implication, type_lien, poids, commentaire)
+    )
+    connexion.commit()
+
+
+def supprimer_liaison(connexion, type_applicable, liaison_id):
+    """
+    Supprime une liaison.
+    Note:
+    - On ne "redecoupe" pas les reseaux automatiquement (trop couteux / complexe)
+    - La simulation peut ignorer les reseaux vides
+    - Le menu "Voir reseaux" reste fiable, mais un reseau pourrait devenir "disperse"
+      si on supprime beaucoup. (Cas rare / acceptable, ou on fera un "rebuild" plus tard.)
+    """
+    cur = connexion.cursor()
+    cur.execute(
+        "DELETE FROM liaisons_applicables WHERE type_applicable = ? AND id = ?",
+        (type_applicable, liaison_id)
+    )
+    connexion.commit()
+
+
+def lister_liaisons(connexion, type_applicable, limite=250):
+    """Liste les liaisons recentes d'un type (O/E)."""
+    cur = connexion.cursor()
+    cur.execute(
+        """
+        SELECT id, reseau_id, source_id, cible_id, implication, type_lien, poids, commentaire, date_creation
+        FROM liaisons_applicables
+        WHERE type_applicable = ?
         ORDER BY id DESC
         LIMIT ?
         """,
-        (limite,)
+        (type_applicable, limite)
     )
     return cur.fetchall()
 
 
-def lister_impacts_evenement(connexion, evenement_id):
-    """Liste les impacts d'un evenement."""
+def lister_reseaux_ids(connexion, type_applicable):
+    """Liste les reseaux existants pour un type, tries par id."""
     cur = connexion.cursor()
     cur.execute(
         """
-        SELECT id, objet_id, niveau, poids_final, role, origine, commentaire, date_creation
-        FROM impacts_evenements
-        WHERE evenement_id = ?
-        ORDER BY niveau ASC, poids_final DESC
+        SELECT id
+        FROM reseaux_applicables
+        WHERE type_applicable = ?
+        ORDER BY id ASC
         """,
-        (evenement_id,)
+        (type_applicable,)
+    )
+    return [r[0] for r in cur.fetchall()]
+
+
+def liaisons_par_reseau(connexion, type_applicable, reseau_id):
+    """Retourne toutes les liaisons d'un reseau."""
+    cur = connexion.cursor()
+    cur.execute(
+        """
+        SELECT id, source_id, cible_id, implication, type_lien, poids, commentaire
+        FROM liaisons_applicables
+        WHERE type_applicable = ? AND reseau_id = ?
+        ORDER BY id ASC
+        """,
+        (type_applicable, reseau_id)
     )
     return cur.fetchall()
 
 
-def supprimer_impact(connexion, impact_id):
-    """Supprime un impact."""
-    cur = connexion.cursor()
-    cur.execute("DELETE FROM impacts_evenements WHERE id = ?", (impact_id,))
-    connexion.commit()
+# ============================================================
+# "Voir reseaux": construction d'un texte lisible
+# ============================================================
+def nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, element_id):
+    """Nom lisible d'un element selon type (objet / evenement)."""
+    if type_applicable == "O":
+        n = nom_objet_par_id(connexion, colonne_id_objet, colonne_nom_objet, element_id)
+        return (n or "").strip()
+    n = nom_evenement_par_id(connexion, element_id)
+    return (n or "").strip()
 
 
-def ecrire_impact(connexion, evenement_id, objet_id, niveau, poids_final, role, origine, commentaire):
+def resumer_reseau_lisible(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, reseau_id):
     """
-    Ecrit (ou met a jour) un impact UNIQUE(evenement_id, objet_id).
-    Regle:
-    - garder le niveau le plus faible
-    - garder le poids_final le plus fort
+    Objectif: produire un rendu "humain" proche de ton exemple, sans graphe.
+
+    Idee (simple mais efficace):
+    - On cherche des "noeuds centraux" (cibles) recevant plusieurs implications '->'.
+      Exemple: stylo->4c + mur->4c => cible centrale = 4c, sources = {stylo, mur}
+    - On affiche d'abord ces groupes sous forme:
+        S(a,b) -> C
+      ou si une seule source:
+        a -> C
+    - Puis on affiche les equivalences (<->) rattachees:
+        C <-> X
+
+    Remarque:
+    - Ce n'est pas un solveur parfait de graphes.
+    - Mais c'est lisible, stable, et suffisant pour un "aperçu reseau".
     """
-    cur = connexion.cursor()
+    liaisons = liaisons_par_reseau(connexion, type_applicable, reseau_id)
+    if not liaisons:
+        return "Reseau vide."
 
-    cur.execute(
-        """
-        INSERT OR IGNORE INTO impacts_evenements (evenement_id, objet_id, niveau, poids_final, role, origine, commentaire)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (evenement_id, objet_id, niveau, poids_final, role, origine, commentaire)
-    )
+    # Comptage des implications vers chaque cible
+    sources_par_cible = {}  # cible_id -> set(source_id)
+    equivalences = []       # (a,b) pour <->
 
-    cur.execute(
-        """
-        UPDATE impacts_evenements
-        SET
-          niveau = CASE WHEN ? < niveau THEN ? ELSE niveau END,
-          poids_final = CASE WHEN ? > poids_final THEN ? ELSE poids_final END
-        WHERE evenement_id = ? AND objet_id = ?
-        """,
-        (niveau, niveau, poids_final, poids_final, evenement_id, objet_id)
-    )
+    for (_lid, sid, cid, impl, _tl, _pw, _comm) in liaisons:
+        if impl == "<->":
+            equivalences.append((sid, cid))
+            # Une equivalence peut aussi servir de "connexion",
+            # mais on la montrera a part pour garder un texte clair.
+        else:
+            sources_par_cible.setdefault(cid, set()).add(sid)
 
-    connexion.commit()
+    # Cibles triees: celles qui ont le plus de sources en premier
+    cibles_triees = sorted(sources_par_cible.keys(), key=lambda c: (-len(sources_par_cible[c]), c))
+
+    # Construction de segments texte
+    segments = []
+
+    # On conserve un set des elements deja mentionnes (pour limiter les repetitions)
+    deja = set()
+
+    for cible_id in cibles_triees:
+        sources = sorted(list(sources_par_cible[cible_id]))
+        nom_cible = nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, cible_id) or ("#" + str(cible_id))
+
+        if len(sources) >= 2:
+            noms_sources = []
+            for sid in sources:
+                noms_sources.append(nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, sid) or ("#" + str(sid)))
+                deja.add(sid)
+            deja.add(cible_id)
+            segments.append("S(" + ", ".join(noms_sources) + ") -> " + nom_cible)
+        elif len(sources) == 1:
+            sid = sources[0]
+            nom_source = nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, sid) or ("#" + str(sid))
+            deja.add(sid)
+            deja.add(cible_id)
+            segments.append(nom_source + " -> " + nom_cible)
+
+    # Ajout equivalences de facon simple
+    # On essaye de les accrocher a un segment existant (si possible) en fin de phrase.
+    for (a, b) in equivalences:
+        nom_a = nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, a) or ("#" + str(a))
+        nom_b = nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, b) or ("#" + str(b))
+        deja.add(a)
+        deja.add(b)
+
+        # Si un des deux est deja mentionne, on affiche "X <-> Y" dans la suite
+        segments.append(nom_a + " <-> " + nom_b)
+
+    # Si segments est vide (cas: reseau uniquement en equivalences), on affiche les equivalences
+    if not segments:
+        if equivalences:
+            segments = [ (nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, a) or ("#" + str(a)))
+                         + " <-> " +
+                         (nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, b) or ("#" + str(b)))
+                         for (a, b) in equivalences ]
+        else:
+            segments = ["Reseau sans structure lisible."]
+
+    # Assemblage final (style "R1: ...")
+    texte = " ; ".join([s for s in segments if s.strip()])
+    return texte if texte else "Reseau."
 
 
 # ============================================================
-# Propagation (BFS)
+# Chargement contexte univers
 # ============================================================
-def calculer_propagation(connexion, objets_depart, poids_depart, profondeur_max, attenuation):
-    """
-    Propagation sur le graphe:
-    - niveau 0 = objets_depart
-    - voisins niveau 1, etc.
-    - poids_final = poids_depart * (attenuation ** niveau)
-    """
-    if profondeur_max < 0:
-        profondeur_max = 0
-    if attenuation < 0:
-        attenuation = 0.0
-    if attenuation > 1.0:
-        attenuation = 1.0
-
-    resultat = {}  # objet_id -> (niveau, poids_final)
-    file_bfs = []  # (objet_id, niveau)
-
-    for oid in objets_depart:
-        resultat[oid] = (0, poids_depart)
-        file_bfs.append((oid, 0))
-
-    while file_bfs:
-        objet_courant, niveau_courant = file_bfs.pop(0)
-
-        if niveau_courant >= profondeur_max:
-            continue
-
-        niveau_suivant = niveau_courant + 1
-        poids_suivant = poids_depart * (attenuation ** niveau_suivant)
-
-        for voisin in voisins_objet(connexion, objet_courant):
-            if voisin is None:
-                continue
-
-            if voisin not in resultat:
-                resultat[voisin] = (niveau_suivant, poids_suivant)
-                file_bfs.append((voisin, niveau_suivant))
-            else:
-                ancien_niveau, ancien_poids = resultat[voisin]
-                if niveau_suivant < ancien_niveau:
-                    resultat[voisin] = (niveau_suivant, poids_suivant)
-                    file_bfs.append((voisin, niveau_suivant))
-                elif niveau_suivant == ancien_niveau and poids_suivant > ancien_poids:
-                    resultat[voisin] = (niveau_suivant, poids_suivant)
-
-    return resultat
-
-
-# ============================================================
-# Contexte univers
-# ============================================================
-uid = lire_parametre_get("uid", "").strip()
+uid = (lire_parametre_get("uid", "") or "").strip()
 if not uid:
     print("<h1>Erreur : univers non specifie</h1>")
     raise SystemExit
 
-uid_encode = urllib.parse.quote(uid)
+uid_encode = encoder_url(uid)
 nom_univers = recuperer_nom_univers(uid)
 
 chemin_bdd = construire_chemin_univers(uid)
@@ -452,313 +586,241 @@ if not os.path.exists(chemin_bdd):
     raise SystemExit
 
 connexion = sqlite3.connect(chemin_bdd)
-creer_tables_monde_si_besoin(connexion)
+creer_tables_si_besoin(connexion)
 
-colonne_id, colonne_nom = detecter_colonnes_stat_objects(connexion)
-if not colonne_id or not colonne_nom:
-    print("<h1>Erreur : stat_objects invalide</h1>")
+# Table objets requise si on veut lier des objets
+colonne_id_objet, colonne_nom_objet = detecter_colonnes_stat_objects(connexion)
+if not colonne_id_objet or not colonne_nom_objet:
+    print("<h1>Erreur : table stat_objects invalide</h1>")
     connexion.close()
     raise SystemExit
 
 
 # ============================================================
-# Parametres UI
+# Parametres UI (tout en GET)
 # ============================================================
-action = lire_parametre_get("action", "").strip()
+action = (lire_parametre_get("action", "") or "").strip()
 
-recherche_objet = lire_parametre_get("recherche_objet", "").strip()
+# Mode reseau: O (objets) / E (evenements)
+type_applicable = (lire_parametre_get("type_applicable", "O") or "O").strip().upper()
+if type_applicable not in ("O", "E"):
+    type_applicable = "O"
 
-selection_ids_texte = lire_parametre_get("selection_ids", "").strip()
-selection_ids = ids_depuis_chaine(selection_ids_texte)
+# Recherche unique (depend du mode)
+texte_recherche = (lire_parametre_get("recherche", "") or "").strip()
 
-objet_source_str = lire_parametre_get("objet_source_id", "").strip()
-objet_source_id = int(objet_source_str) if objet_source_str.isdigit() else None
+# Source + cibles (liste)
+source_id_str = (lire_parametre_get("source_id", "") or "").strip()
+source_id = int(source_id_str) if source_id_str.isdigit() else None
 
-evenement_id_str = lire_parametre_get("evenement_id", "").strip()
-evenement_id = int(evenement_id_str) if evenement_id_str.isdigit() else None
+cibles_ids_str = (lire_parametre_get("cibles_ids", "") or "").strip()
+cibles_ids = ids_depuis_chaine(cibles_ids_str)
 
-evenement_choisi_str = lire_parametre_get("evenement_choisi_id", "").strip()
-evenement_choisi_id = int(evenement_choisi_str) if evenement_choisi_str.isdigit() else None
+# Implication (obligatoire)
+implication = (lire_parametre_get("implication", "->") or "->").strip()
+if implication not in ("->", "<->"):
+    implication = "->"
+
+# Precision (optionnelle)
+type_lien = (lire_parametre_get("type_lien", "associe") or "associe").strip()
+poids_str = (lire_parametre_get("poids", "1.0") or "1.0").strip()
+commentaire = (lire_parametre_get("commentaire", "") or "").strip()
+
+# Convertir poids (robuste)
+try:
+    poids = float(poids_str.replace(",", "."))
+except Exception:
+    poids = 1.0
+
+# Onglet / vue (priorite aux boutons)
+vue = (lire_parametre_get("vue", "liaison") or "liaison").strip().lower()
+if vue not in ("liaison", "reseaux", "liste"):
+    vue = "liaison"
 
 
 # ============================================================
-# Messages utilisateur
+# Messages UI
 # ============================================================
 message_ok = ""
 message_erreur = ""
 
 
 # ============================================================
-# Actions: selection
+# Actions: definir source / ajouter cible / retirer cible / vider
 # ============================================================
-if action == "ajouter_selection":
-    oid_str = lire_parametre_get("objet_ajout_id", "").strip()
-    if oid_str.isdigit():
-        oid = int(oid_str)
-        if oid not in selection_ids:
-            selection_ids.append(oid)
-        message_ok = "Objet ajoute a la selection."
-    else:
-        message_erreur = "Objet invalide (ajout selection)."
-
-if action == "retirer_selection":
-    oid_str = lire_parametre_get("objet_retire_id", "").strip()
-    if oid_str.isdigit():
-        oid = int(oid_str)
-        selection_ids = [x for x in selection_ids if x != oid]
-        message_ok = "Objet retire de la selection."
-    else:
-        message_erreur = "Objet invalide (retrait selection)."
-
 if action == "definir_source":
-    oid_str = lire_parametre_get("objet_source_nouveau_id", "").strip()
-    if oid_str.isdigit():
-        objet_source_id = int(oid_str)
-        objet_source_str = str(objet_source_id)
-        message_ok = "Objet source defini."
+    nid = (lire_parametre_get("nouveau_source_id", "") or "").strip()
+    if nid.isdigit():
+        source_id = int(nid)
+        message_ok = "Source definie."
     else:
-        message_erreur = "Objet invalide (definir source)."
+        message_erreur = "Source invalide."
 
-# Mise a jour chaine selection
-selection_ids_texte = chaine_depuis_ids(selection_ids)
+if action == "ajouter_cible":
+    nid = (lire_parametre_get("ajout_id", "") or "").strip()
+    if nid.isdigit():
+        cid = int(nid)
+        if cid not in cibles_ids:
+            cibles_ids.append(cid)
+        message_ok = "Cible ajoutee."
+    else:
+        message_erreur = "Cible invalide."
+
+if action == "retirer_cible":
+    nid = (lire_parametre_get("retire_id", "") or "").strip()
+    if nid.isdigit():
+        cid = int(nid)
+        cibles_ids = [x for x in cibles_ids if x != cid]
+        message_ok = "Cible retiree."
+    else:
+        message_erreur = "Cible invalide."
+
+if action == "vider_cibles":
+    cibles_ids = []
+    message_ok = "Cibles videes."
+
+# Mettre a jour la chaine apres actions
+cibles_ids_str = chaine_depuis_ids(cibles_ids)
 
 
 # ============================================================
-# Action: lier objets
+# Action: creer liaison (simple uniquement)
 # ============================================================
-if action == "lier_objets":
-    type_lien = lire_parametre_get("type_lien", "associe").strip()
-    poids_str = lire_parametre_get("poids_liaison", "1.0").strip()
-    commentaire = lire_parametre_get("commentaire_liaison", "").strip()
-
-    if objet_source_id is None:
-        message_erreur = "Etape 1: definis d'abord un objet source (bouton 'Definir source')."
-    elif not selection_ids:
-        message_erreur = "Etape 1: selection vide. Ajoute des objets avec 'Ajouter'."
+if action == "creer_liaison":
+    if source_id is None:
+        message_erreur = "Aucune source selectionnee."
+    elif not cibles_ids:
+        message_erreur = "Aucune cible selectionnee."
     else:
-        try:
-            poids = float(poids_str.replace(",", "."))
-        except Exception:
-            poids = 1.0
-
         try:
             nb = 0
-            for cible_id in selection_ids:
-                if cible_id != objet_source_id:
-                    ajouter_liaison_objets(connexion, objet_source_id, cible_id, type_lien, poids, commentaire, symetrique=True)
-                    nb += 1
-            message_ok = "Liaisons creees : " + str(nb)
+            for cid in cibles_ids:
+                if cid == source_id:
+                    continue  # eviter lien vers soi
+                reseau_id = choisir_reseau_pour_nouvelle_liaison(connexion, type_applicable, source_id, cid)
+                inserer_liaison(
+                    connexion,
+                    type_applicable=type_applicable,
+                    reseau_id=reseau_id,
+                    source_id=source_id,
+                    cible_id=cid,
+                    implication=implication,
+                    type_lien=(type_lien or "associe"),
+                    poids=poids,
+                    commentaire=commentaire
+                )
+                nb += 1
+            message_ok = "Liaison(s) creee(s): " + str(nb)
         except Exception as e:
-            message_erreur = "Erreur creation liaisons : " + str(e)
+            message_erreur = "Erreur creation liaison: " + str(e)
 
-
-# ============================================================
 # Action: supprimer liaison
-# ============================================================
-if action == "supprimer_liaison_objet":
-    liaison_id_str = lire_parametre_get("liaison_id", "").strip()
-    if liaison_id_str.isdigit():
+if action == "supprimer_liaison":
+    lid = (lire_parametre_get("liaison_id", "") or "").strip()
+    if lid.isdigit():
         try:
-            supprimer_liaison_objets(connexion, int(liaison_id_str))
+            supprimer_liaison(connexion, type_applicable, int(lid))
             message_ok = "Liaison supprimee."
         except Exception as e:
-            message_erreur = "Erreur suppression : " + str(e)
+            message_erreur = "Erreur suppression: " + str(e)
     else:
         message_erreur = "Id liaison invalide."
 
 
 # ============================================================
-# Parametres evenement (lecture)
+# Preparations affichage: noms source/cibles
 # ============================================================
-nom_evenement = lire_parametre_get("nom_evenement", "").strip()
-poids_global_str = lire_parametre_get("poids_global", "1.0").strip()
-intensite_str = lire_parametre_get("intensite", "1.0").strip()
+def nom_element_affichage(type_applicable, element_id):
+    """Nom + id pour affichage UI."""
+    if element_id is None:
+        return ""
+    if type_applicable == "O":
+        n = nom_objet_par_id(connexion, colonne_id_objet, colonne_nom_objet, element_id)
+    else:
+        n = nom_evenement_par_id(connexion, element_id)
+    n = (n or "").strip()
+    if not n:
+        n = "Element"
+    return n + " (#" + str(element_id) + ")"
 
-# Options avancees
-duree_str = lire_parametre_get("duree", "1").strip()
-probabilite_str = lire_parametre_get("probabilite", "1.0").strip()
-tags = lire_parametre_get("tags", "").strip()
-description = lire_parametre_get("description", "").strip()
 
-# Propagation
-role = lire_parametre_get("role", "impacte").strip()
-poids_lien_str = lire_parametre_get("poids_lien", "1.0").strip()
-profondeur_max_str = lire_parametre_get("profondeur_max", "5").strip()
-attenuation_str = lire_parametre_get("attenuation", "0.70").strip()
-
-# Preview calcule uniquement si demande
-preview_impacts = None
-
-# Conversions robustes
-try:
-    poids_global = float(poids_global_str.replace(",", "."))
-except Exception:
-    poids_global = 1.0
-
-try:
-    intensite = float(intensite_str.replace(",", "."))
-except Exception:
-    intensite = 1.0
-
-try:
-    duree = int(duree_str)
-except Exception:
-    duree = 1
-
-try:
-    probabilite = float(probabilite_str.replace(",", "."))
-except Exception:
-    probabilite = 1.0
-
-try:
-    poids_lien = float(poids_lien_str.replace(",", "."))
-except Exception:
-    poids_lien = 1.0
-
-try:
-    profondeur_max = int(profondeur_max_str)
-except Exception:
-    profondeur_max = 5
-
-try:
-    attenuation = float(attenuation_str.replace(",", "."))
-except Exception:
-    attenuation = 0.70
-
-# Poids depart reel (niveau 0)
-poids_depart = poids_global * intensite * poids_lien
+nom_source = nom_element_affichage(type_applicable, source_id) if source_id is not None else ""
+noms_cibles = [(cid, nom_element_affichage(type_applicable, cid)) for cid in cibles_ids]
 
 
 # ============================================================
-# Actions evenement
-# ============================================================
-if action == "previsualiser_evenement":
-    if not selection_ids:
-        message_erreur = "Etape 2: preview impossible, selection vide."
-    else:
-        preview_impacts = calculer_propagation(connexion, selection_ids, poids_depart, profondeur_max, attenuation)
-        message_ok = "Preview: " + str(len(preview_impacts)) + " objets impactes."
-
-if action == "creer_evenement":
-    if not nom_evenement:
-        message_erreur = "Etape 2: nom evenement manquant."
-    elif not selection_ids:
-        message_erreur = "Etape 2: selection vide."
-    else:
-        try:
-            nouvel_id = creer_evenement(connexion, nom_evenement, poids_global, intensite, duree, probabilite, tags, description)
-
-            impacts = calculer_propagation(connexion, selection_ids, poids_depart, profondeur_max, attenuation)
-
-            for oid, (niv, poids_calcule) in impacts.items():
-                origine = "direct" if niv == 0 else "propagation"
-                commentaire_impact = "selection" if niv == 0 else "auto"
-                ecrire_impact(connexion, nouvel_id, oid, niv, poids_calcule, role, origine, commentaire_impact)
-
-            evenement_id = nouvel_id
-            evenement_id_str = str(nouvel_id)
-            message_ok = "Evenement cree: " + nom_evenement + " (impacts: " + str(len(impacts)) + ")"
-        except Exception as e:
-            message_erreur = "Erreur creation evenement : " + str(e)
-
-if action == "ouvrir_evenement":
-    if evenement_choisi_id is not None:
-        evenement_id = evenement_choisi_id
-        evenement_id_str = str(evenement_choisi_id)
-        message_ok = "Evenement ouvert."
-    else:
-        message_erreur = "Choisis un evenement dans la liste."
-
-if action == "supprimer_impact":
-    impact_id_str = lire_parametre_get("impact_id", "").strip()
-    if impact_id_str.isdigit():
-        try:
-            supprimer_impact(connexion, int(impact_id_str))
-            message_ok = "Impact supprime."
-        except Exception as e:
-            message_erreur = "Erreur suppression impact : " + str(e)
-    else:
-        message_erreur = "Id impact invalide."
-
-
-# ============================================================
-# Donnees affichage: recherche + suggestions
+# Recherche (selon mode)
 # ============================================================
 resultats_recherche = []
-liste_suggestions = []
-
-if recherche_objet:
+if texte_recherche:
     try:
-        resultats_recherche = rechercher_objets(connexion, colonne_id, colonne_nom, recherche_objet, limite=25)
+        if type_applicable == "O":
+            resultats_recherche = rechercher_objets(connexion, colonne_id_objet, colonne_nom_objet, texte_recherche, limite=25)
+        else:
+            resultats_recherche = rechercher_evenements(connexion, texte_recherche, limite=25)
     except Exception:
         resultats_recherche = []
 
-    if not resultats_recherche:
-        try:
-            noms = recuperer_tous_les_noms(connexion, colonne_nom)
-            liste_suggestions = suggestions_mot_proche(recherche_objet, noms, max_suggestions=8)
-        except Exception:
-            liste_suggestions = []
-
 
 # ============================================================
-# Donnees affichage: source + liaisons
+# Liste liaisons (pour onglet "liste")
 # ============================================================
-nom_objet_source = ""
-liaisons_objets_source = []
-
-if objet_source_id is not None:
-    nom_objet_source = recuperer_nom_objet(connexion, colonne_id, colonne_nom, objet_source_id)
-    try:
-        liaisons_objets_source = lister_liaisons_objets(connexion, objet_source_id)
-    except Exception:
-        liaisons_objets_source = []
-
-
-# ============================================================
-# Donnees affichage: evenements + impacts
-# ============================================================
-liste_evenements = []
+liaisons_recentes = []
 try:
-    liste_evenements = lister_evenements(connexion, limite=80)
+    liaisons_recentes = lister_liaisons(connexion, type_applicable, limite=250)
 except Exception:
-    liste_evenements = []
-
-impacts_evenement = []
-if evenement_id is not None:
-    try:
-        impacts_evenement = lister_impacts_evenement(connexion, evenement_id)
-    except Exception:
-        impacts_evenement = []
+    liaisons_recentes = []
 
 
 # ============================================================
-# Nom evenement ouvert (pour resume)
+# Liste reseaux (pour "voir les reseaux")
 # ============================================================
-nom_evenement_ouvert = ""
-if evenement_id is not None:
-    for (eid, nom_evt, pg, it, du, pr, tg, dc) in liste_evenements:
-        if eid == evenement_id:
-            nom_evenement_ouvert = nom_evt
-            break
-
-
-# ============================================================
-# Resume
-# ============================================================
-texte_source_resume = "Aucun"
-if objet_source_id is not None:
-    texte_source_resume = nom_objet_source + " (#" + str(objet_source_id) + ")"
-
-texte_selection_resume = str(len(selection_ids)) + " objet(s)"
-
-texte_evt_resume = "Aucun"
-if evenement_id is not None and nom_evenement_ouvert:
-    texte_evt_resume = nom_evenement_ouvert + " (#" + str(evenement_id) + ")"
+reseaux_ids = []
+try:
+    reseaux_ids = lister_reseaux_ids(connexion, type_applicable)
+except Exception:
+    reseaux_ids = []
 
 
 # ============================================================
-# HTML / CSS (mystique + simplifie)
+# Construction etat URL commun (pour ne rien perdre)
+# ============================================================
+def url_etat_commun():
+    """
+    Etat minimal a conserver a chaque clic:
+    - uid + type_applicable
+    - source + cibles + recherche
+    - implication + precision
+    - vue (pour rester dans le bon onglet)
+    """
+    return (
+        "uid=" + uid_encode +
+        "&type_applicable=" + encoder_url(type_applicable) +
+        "&source_id=" + encoder_url("" if source_id is None else str(source_id)) +
+        "&cibles_ids=" + encoder_url(cibles_ids_str) +
+        "&recherche=" + encoder_url(texte_recherche) +
+        "&implication=" + encoder_url(implication) +
+        "&type_lien=" + encoder_url(type_lien) +
+        "&poids=" + encoder_url(poids_str) +
+        "&commentaire=" + encoder_url(commentaire) +
+        "&vue=" + encoder_url(vue)
+    )
+
+
+etat = url_etat_commun()
+
+
+# ============================================================
+# Liens navigation (haut de page)
+# ============================================================
+lien_retour_univers = "/cgi-bin/univers_dashboard.py?uid=" + uid_encode
+lien_menu_simulation = "/cgi-bin/simulation.py?uid=" + uid_encode
+lien_evenement = "/cgi-bin/evenement.py?uid=" + uid_encode  # a coder plus tard
+
+
+# ============================================================
+# UI: debut HTML + CSS (design mystique, mais plus clair)
+# IMPORTANT: dans une f-string, les { } de CSS doivent etre doubles {{ }}
 # ============================================================
 print(f"""
 <!DOCTYPE html>
@@ -768,25 +830,31 @@ print(f"""
 <title>Liaison - {echapper_html(nom_univers)}</title>
 
 <style>
+/* ============================================================
+   Fond mystique mais lisible (contraste un peu augmente)
+   ============================================================ */
 body {{
   margin: 0;
   font-family: Arial, sans-serif;
   color: #ffffff;
   min-height: 100vh;
   background:
-    radial-gradient(900px 600px at 18% 18%, rgba(255,216,106,0.12), rgba(0,0,0,0) 62%),
-    radial-gradient(800px 520px at 82% 18%, rgba(190,120,255,0.20), rgba(0,0,0,0) 60%),
-    radial-gradient(900px 650px at 55% 85%, rgba(110,255,220,0.06), rgba(0,0,0,0) 62%),
+    radial-gradient(900px 600px at 18% 18%, rgba(255,216,106,0.10), rgba(0,0,0,0) 62%),
+    radial-gradient(800px 520px at 82% 18%, rgba(190,120,255,0.18), rgba(0,0,0,0) 60%),
+    radial-gradient(900px 650px at 55% 85%, rgba(110,255,220,0.05), rgba(0,0,0,0) 62%),
     linear-gradient(180deg, #05020a 0%, #0b0615 45%, #120a22 100%);
 }}
 body:before {{
   content:"";
-  position:fixed; top:0; left:0; right:0; bottom:0;
-  pointer-events:none;
-  background: radial-gradient(900px 500px at 50% 30%, rgba(255,255,255,0.04), rgba(0,0,0,0) 60%);
-  opacity:0.60;
+  position: fixed; top:0; left:0; right:0; bottom:0;
+  pointer-events: none;
+  background: radial-gradient(900px 500px at 50% 30%, rgba(255,255,255,0.05), rgba(0,0,0,0) 60%);
+  opacity: 0.60;
 }}
 
+/* ============================================================
+   Boutons fixes (navigation)
+   ============================================================ */
 .bouton-retour {{
   position: fixed;
   top: 20px;
@@ -795,29 +863,39 @@ body:before {{
   height: 64px;
   background: url('/back_btn_violet.png') no-repeat center/contain;
 }}
-
-.bouton-simulation {{
+.bouton-top {{
   position: fixed;
-  top: 20px;
   right: 20px;
   padding: 12px 18px;
   border-radius: 999px;
   text-decoration: none;
   font-size: 13px;
+  box-shadow: 0 12px 28px rgba(0,0,0,0.45);
+}}
+.bouton-simulation {{
+  top: 20px;
   color: #FFD86A;
   background: rgba(255,216,106,0.10);
   border: 1px solid rgba(255,216,106,0.34);
-  box-shadow: 0 12px 28px rgba(0,0,0,0.45);
+}}
+.bouton-evenement {{
+  top: 72px;
+  color: rgba(255,255,255,0.88);
+  background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.16);
 }}
 
+/* ============================================================
+   Panel principal
+   ============================================================ */
 .panel {{
   width: 1280px;
   margin: 55px auto;
   padding: 54px;
   box-sizing: border-box;
   border-radius: 30px;
-  background: rgba(14, 6, 26, 0.72);
-  border: 1px solid rgba(255,216,106,0.20);
+  background: rgba(14, 6, 26, 0.76);
+  border: 1px solid rgba(255,216,106,0.22);
   box-shadow: 0 30px 70px rgba(0,0,0,0.62);
 }}
 
@@ -832,24 +910,65 @@ h1 {{
   text-align: center;
   margin-top: 10px;
   font-size: 14px;
-  color: rgba(255,255,255,0.84);
+  color: rgba(255,255,255,0.86);
 }}
 
+/* ============================================================
+   Messages (ok / erreur)
+   ============================================================ */
 .message {{
   margin: 18px 0 0 0;
   padding: 12px 16px;
   border-radius: 14px;
-  background: rgba(0,0,0,0.28);
+  background: rgba(0,0,0,0.30);
   border: 1px solid rgba(255,255,255,0.10);
   font-size: 13px;
 }}
-.message.ok {{ border-color: rgba(120,255,180,0.30); }}
-.message.bad {{ border-color: rgba(255,120,120,0.30); }}
+.message.ok {{ border-color: rgba(120,255,180,0.34); }}
+.message.bad {{ border-color: rgba(255,120,120,0.34); }}
 
-.grille {{
+/* ============================================================
+   Barre de boutons (priorite aux actions)
+   ============================================================ */
+.barre-actions {{
   margin-top: 22px;
   display: grid;
-  grid-template-columns: 1.05fr 0.95fr;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 14px;
+}}
+
+.bouton-carte {{
+  display: block;
+  padding: 14px 18px;
+  border-radius: 18px;
+  text-decoration: none;
+  color: rgba(255,255,255,0.92);
+  background:
+    radial-gradient(700px 260px at 20% 20%, rgba(255,216,106,0.06), rgba(0,0,0,0) 60%),
+    linear-gradient(180deg, rgba(70,28,120,0.58), rgba(45,16,85,0.58));
+  border: 1px solid rgba(255,255,255,0.10);
+  box-shadow: 0 18px 36px rgba(0,0,0,0.50);
+}}
+.bouton-carte.actif {{
+  border-color: rgba(255,216,106,0.34);
+}}
+.bouton-carte .titre {{
+  font-weight: bold;
+  color: #FFD86A;
+}}
+.bouton-carte .desc {{
+  margin-top: 6px;
+  font-size: 12px;
+  opacity: 0.82;
+}}
+
+/* ============================================================
+   Grille contenus
+   ============================================================ */
+.grille {{
+  margin-top: 18px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
   gap: 20px;
 }}
 
@@ -858,8 +977,8 @@ h1 {{
   padding: 22px;
   box-sizing: border-box;
   background:
-    radial-gradient(700px 260px at 20% 20%, rgba(255,216,106,0.06), rgba(0,0,0,0) 60%),
-    linear-gradient(180deg, rgba(70,28,120,0.58), rgba(45,16,85,0.58));
+    radial-gradient(700px 260px at 20% 20%, rgba(255,216,106,0.05), rgba(0,0,0,0) 60%),
+    linear-gradient(180deg, rgba(70,28,120,0.56), rgba(45,16,85,0.56));
   border: 1px solid rgba(255,255,255,0.10);
   box-shadow: 0 18px 36px rgba(0,0,0,0.50);
 }}
@@ -870,13 +989,13 @@ h1 {{
 }}
 
 .label {{
-  display:block;
+  display: block;
   margin: 10px 0 6px 0;
   font-size: 12px;
-  opacity: 0.90;
+  opacity: 0.92;
 }}
 
-.champ-texte, .champ-select, textarea {{
+.champ-texte, .champ-select {{
   width: 100%;
   box-sizing: border-box;
   padding: 12px;
@@ -886,24 +1005,23 @@ h1 {{
   border: 1px solid rgba(255,255,255,0.12);
   outline: none;
 }}
-textarea {{ min-height: 80px; resize: vertical; }}
 
 .ligne-actions {{
-  margin-top: 14px;
-  display:flex;
+  margin-top: 12px;
+  display: flex;
   gap: 10px;
   justify-content: flex-end;
-  align-items:center;
+  align-items: center;
   flex-wrap: wrap;
 }}
 
 .bouton {{
-  display:inline-block;
+  display: inline-block;
   padding: 10px 18px;
   border-radius: 999px;
-  text-decoration:none;
+  text-decoration: none;
   font-size: 13px;
-  cursor:pointer;
+  cursor: pointer;
   color: #FFD86A;
   background: rgba(255,216,106,0.12);
   border: 1px solid rgba(255,216,106,0.38);
@@ -920,14 +1038,14 @@ textarea {{ min-height: 80px; resize: vertical; }}
   border-radius: 14px;
   background: rgba(0,0,0,0.22);
   border: 1px solid rgba(255,255,255,0.10);
-  max-height: 250px;
+  max-height: 260px;
   overflow: auto;
 }}
 
 .ligne-resultat {{
-  display:flex;
+  display: flex;
   justify-content: space-between;
-  align-items:center;
+  align-items: center;
   gap: 10px;
   padding: 8px 0;
   border-bottom: 1px solid rgba(255,255,255,0.06);
@@ -939,22 +1057,25 @@ textarea {{ min-height: 80px; resize: vertical; }}
   opacity: 0.82;
 }}
 
-.suggestions {{
-  margin-top: 10px;
-  display:flex;
-  flex-wrap: wrap;
-  gap: 8px;
+.lien-supprimer {{
+  color: rgba(255,170,170,0.95);
+  text-decoration: none;
+  border: 1px solid rgba(255,120,120,0.30);
+  padding: 6px 10px;
+  border-radius: 999px;
+  display: inline-block;
 }}
 
-.suggestion {{
-  display:inline-block;
-  padding: 8px 12px;
-  border-radius: 999px;
-  text-decoration:none;
-  font-size: 12px;
-  color: #FFD86A;
-  background: rgba(255,216,106,0.10);
-  border: 1px solid rgba(255,216,106,0.28);
+details {{
+  margin-top: 14px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: rgba(0,0,0,0.18);
+  border: 1px solid rgba(255,255,255,0.10);
+}}
+summary {{
+  cursor: pointer;
+  color: rgba(255,255,255,0.92);
 }}
 
 .table {{
@@ -964,427 +1085,373 @@ textarea {{ min-height: 80px; resize: vertical; }}
   font-size: 13px;
 }}
 .table th, .table td {{
-  text-align:left;
+  text-align: left;
   padding: 10px 8px;
   border-bottom: 1px solid rgba(255,255,255,0.08);
   vertical-align: top;
-}}
-
-.lien-supprimer {{
-  color: rgba(255,170,170,0.95);
-  text-decoration:none;
-  border: 1px solid rgba(255,120,120,0.30);
-  padding: 6px 10px;
-  border-radius: 999px;
-  display:inline-block;
-}}
-
-.resume {{
-  display:grid;
-  grid-template-columns: 1fr 1fr 1fr;
-  gap: 12px;
-  margin-top: 18px;
-}}
-.bloc-resume {{
-  padding: 12px 14px;
-  border-radius: 16px;
-  background: rgba(0,0,0,0.22);
-  border: 1px solid rgba(255,255,255,0.10);
-}}
-details {{
-  margin-top: 12px;
-  padding: 10px 12px;
-  border-radius: 14px;
-  background: rgba(0,0,0,0.18);
-  border: 1px solid rgba(255,255,255,0.10);
-}}
-summary {{
-  cursor: pointer;
-  color: rgba(255,255,255,0.90);
 }}
 </style>
 </head>
 
 <body>
 
-<a class="bouton-retour" href="/cgi-bin/univers_dashboard.py?uid={uid_encode}" title="Retour"></a>
-<a class="bouton-simulation" href="/cgi-bin/simulation.py?uid={uid_encode}" title="Menu Simulation">Menu Simulation</a>
+<a class="bouton-retour" href="{lien_retour_univers}" title="Retour"></a>
+<a class="bouton-top bouton-simulation" href="{lien_menu_simulation}" title="Menu Simulation">Menu Simulation</a>
+<a class="bouton-top bouton-evenement" href="{lien_evenement}" title="Creer un evenement">Creer un evenement</a>
 
 <div class="panel">
-  <h1>Liaison</h1>
+  <h1>Liaison / Reseaux</h1>
 
   <div class="ligne-univers">
     Univers : <strong>{echapper_html(nom_univers)}</strong>
     &nbsp;|&nbsp; ID : {echapper_html(uid)}
+    &nbsp;|&nbsp; Mode : <strong>{'Objets' if type_applicable=='O' else 'Evenements'}</strong>
   </div>
 """)
 
-# Messages
+# Messages (feedback utilisateur)
 if message_ok:
     print(f'<div class="message ok">{echapper_html(message_ok)}</div>')
 if message_erreur:
     print(f'<div class="message bad">{echapper_html(message_erreur)}</div>')
 
-# Resume
+# ============================================================
+# Barre d'onglets (boutons cartes)
+# - Liaison: ecran principal (choisir source/cible + creer)
+# - Voir reseaux: resume "R1: ..."
+# - Liste liaisons: table brute (debug / suppression)
+# ============================================================
+lien_vue_liaison = "/cgi-bin/liaison.py?" + etat.replace("&vue=" + encoder_url(vue), "&vue=liaison")
+lien_vue_reseaux = "/cgi-bin/liaison.py?" + etat.replace("&vue=" + encoder_url(vue), "&vue=reseaux")
+lien_vue_liste = "/cgi-bin/liaison.py?" + etat.replace("&vue=" + encoder_url(vue), "&vue=liste")
+
 print(f"""
-  <div class="resume">
-    <div class="bloc-resume">
-      <div class="petit">Source (pour lier)</div>
-      <div><strong>{echapper_html(texte_source_resume)}</strong></div>
-    </div>
-    <div class="bloc-resume">
-      <div class="petit">Selection (utilisee partout)</div>
-      <div><strong>{echapper_html(texte_selection_resume)}</strong></div>
-    </div>
-    <div class="bloc-resume">
-      <div class="petit">Evenement ouvert</div>
-      <div><strong>{echapper_html(texte_evt_resume)}</strong></div>
-    </div>
+  <div class="barre-actions">
+    <a class="bouton-carte {'actif' if vue=='liaison' else ''}" href="{lien_vue_liaison}">
+      <div class="titre">Ajouter une liaison</div>
+      <div class="desc">Choisir source + cible(s), puis creer.</div>
+    </a>
+
+    <a class="bouton-carte {'actif' if vue=='reseaux' else ''}" href="{lien_vue_reseaux}">
+      <div class="titre">Voir les reseaux</div>
+      <div class="desc">R1: S(a,b) -> C <-> X (resume lisible).</div>
+    </a>
+
+    <a class="bouton-carte {'actif' if vue=='liste' else ''}" href="{lien_vue_liste}">
+      <div class="titre">Liste des liaisons</div>
+      <div class="desc">Vue brute + suppression.</div>
+    </a>
   </div>
-
-  <div class="grille">
-    <!-- Colonne gauche -->
-    <div class="carte">
-      <h2>0) Trouver des objets</h2>
-
-      <form method="get" action="/cgi-bin/liaison.py">
-        <input type="hidden" name="uid" value="{echapper_html(uid)}">
-        <input type="hidden" name="selection_ids" value="{echapper_html(selection_ids_texte)}">
-        <input type="hidden" name="objet_source_id" value="{echapper_html(objet_source_str)}">
-        <input type="hidden" name="evenement_id" value="{echapper_html(evenement_id_str)}">
-
-        <label class="label">Recherche</label>
-        <input class="champ-texte" type="text" name="recherche_objet"
-               value="{echapper_html(recherche_objet)}"
-               placeholder="Ex: ecole, tableau, stylo...">
-
-        <div class="ligne-actions">
-          <button class="bouton" type="submit">Chercher</button>
-          <a class="bouton bouton-secondaire" href="/cgi-bin/liaison.py?uid={uid_encode}">Reset</a>
-        </div>
-      </form>
 """)
 
-# Resultats recherche
-if recherche_objet:
-    if resultats_recherche:
+# ============================================================
+# VUE 1: "liaison" (ecran principal, interface plus simple)
+# ============================================================
+if vue == "liaison":
+    # Liens pour changer mode (Objets / Evenements)
+    lien_mode_objets = "/cgi-bin/liaison.py?uid=" + uid_encode + "&type_applicable=O&vue=liaison"
+    lien_mode_evenements = "/cgi-bin/liaison.py?uid=" + uid_encode + "&type_applicable=E&vue=liaison"
+
+    print(f"""
+    <div class="grille">
+
+      <!-- ===============================
+           Colonne gauche: Recherche
+           =============================== -->
+      <div class="carte">
+        <h2>1) Trouver une source / des cibles</h2>
+
+        <div class="message">
+          Clique sur <strong>Source</strong> pour definir la source,
+          puis sur <strong>+ Cible</strong> pour ajouter des cibles.
+        </div>
+
+        <!-- Boutons mode objets/evenements (simples, pas de JS) -->
+        <div class="ligne-actions">
+          <a class="bouton {'bouton-secondaire' if type_applicable!='O' else ''}" href="{lien_mode_objets}">Mode Objets</a>
+          <a class="bouton {'bouton-secondaire' if type_applicable!='E' else ''}" href="{lien_mode_evenements}">Mode Evenements</a>
+        </div>
+
+        <!-- Formulaire recherche -->
+        <form method="get" action="/cgi-bin/liaison.py">
+          <input type="hidden" name="uid" value="{echapper_html(uid)}">
+          <input type="hidden" name="type_applicable" value="{echapper_html(type_applicable)}">
+          <input type="hidden" name="vue" value="liaison">
+
+          <!-- Conserver selections -->
+          <input type="hidden" name="source_id" value="{echapper_html('' if source_id is None else str(source_id))}">
+          <input type="hidden" name="cibles_ids" value="{echapper_html(cibles_ids_str)}">
+
+          <!-- Conserver options -->
+          <input type="hidden" name="implication" value="{echapper_html(implication)}">
+          <input type="hidden" name="type_lien" value="{echapper_html(type_lien)}">
+          <input type="hidden" name="poids" value="{echapper_html(poids_str)}">
+          <input type="hidden" name="commentaire" value="{echapper_html(commentaire)}">
+
+          <label class="label">Recherche</label>
+          <input class="champ-texte" type="text" name="recherche"
+                 value="{echapper_html(texte_recherche)}"
+                 placeholder="Ex: stylo, mur, guerre froide...">
+
+          <div class="ligne-actions">
+            <button class="bouton" type="submit">Chercher</button>
+            <a class="bouton bouton-secondaire" href="/cgi-bin/liaison.py?uid={uid_encode}&type_applicable={type_applicable}&vue=liaison">Reset</a>
+          </div>
+        </form>
+    """)
+
+    # Affichage resultats recherche
+    if texte_recherche:
         print('<div class="zone-resultats">')
-        for (oid, onom) in resultats_recherche:
-            lien_ajout = (
-                f"/cgi-bin/liaison.py?uid={uid_encode}"
-                f"&action=ajouter_selection"
-                f"&objet_ajout_id={oid}"
-                f"&recherche_objet={urllib.parse.quote(recherche_objet)}"
-                f"&selection_ids={urllib.parse.quote(selection_ids_texte)}"
-                f"&objet_source_id={urllib.parse.quote(objet_source_str)}"
-                f"&evenement_id={urllib.parse.quote(evenement_id_str)}"
-            )
-            lien_source = (
-                f"/cgi-bin/liaison.py?uid={uid_encode}"
-                f"&action=definir_source"
-                f"&objet_source_nouveau_id={oid}"
-                f"&recherche_objet={urllib.parse.quote(recherche_objet)}"
-                f"&selection_ids={urllib.parse.quote(selection_ids_texte)}"
-                f"&evenement_id={urllib.parse.quote(evenement_id_str)}"
-            )
+        if not resultats_recherche:
+            print(f'<div class="petit">Aucun resultat pour "{echapper_html(texte_recherche)}".</div>')
+        else:
+            for ligne in resultats_recherche:
+                # Selon type, le tuple n'a pas la meme forme
+                if type_applicable == "O":
+                    element_id = int(ligne[0])
+                    element_nom = str(ligne[1])
+                    label_type = "Objet"
+                else:
+                    element_id = int(ligne[0])
+                    element_nom = str(ligne[1])
+                    label_type = "Evt"
+
+                # Lien definir source
+                lien_source = "/cgi-bin/liaison.py?" + etat + "&action=definir_source&nouveau_source_id=" + str(element_id)
+                # Lien ajouter cible
+                lien_cible = "/cgi-bin/liaison.py?" + etat + "&action=ajouter_cible&ajout_id=" + str(element_id)
+
+                print(f"""
+                  <div class="ligne-resultat">
+                    <div>
+                      <strong>{echapper_html(element_nom)}</strong>
+                      <span class="petit">({label_type} #{echapper_html(element_id)})</span>
+                    </div>
+                    <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
+                      <a class="bouton bouton-secondaire" href="{lien_source}">Source</a>
+                      <a class="bouton" href="{lien_cible}">+ Cible</a>
+                    </div>
+                  </div>
+                """)
+        print("</div>")
+
+    # Affichage source/cibles (claire)
+    print("<h2 style='margin-top:18px;'>Etat actuel</h2>")
+
+    if source_id is None:
+        print('<div class="message bad">Source: aucune. (Clique "Source" dans les resultats)</div>')
+    else:
+        print(f'<div class="message ok">Source: <strong>{echapper_html(nom_source)}</strong></div>')
+
+    if not noms_cibles:
+        print('<div class="message">Cibles: aucune. (Clique "+ Cible" dans les resultats)</div>')
+    else:
+        print('<div class="message">Cibles: <strong>' + echapper_html(str(len(noms_cibles))) + '</strong></div>')
+        print('<div class="zone-resultats">')
+        for (cid, lib) in noms_cibles:
+            lien_retire = "/cgi-bin/liaison.py?" + etat + "&action=retirer_cible&retire_id=" + str(cid)
             print(f"""
               <div class="ligne-resultat">
-                <div>
-                  <strong>{echapper_html(onom)}</strong>
-                  <span class="petit">(# {echapper_html(oid)})</span>
-                </div>
-                <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
-                  <a class="bouton bouton-secondaire" href="{lien_source}">Definir source</a>
-                  <a class="bouton" href="{lien_ajout}">Ajouter</a>
-                </div>
+                <div><strong>{echapper_html(lib)}</strong></div>
+                <a class="bouton bouton-secondaire" href="{lien_retire}">Retirer</a>
               </div>
             """)
         print("</div>")
-    else:
-        print(f'<div class="message bad">Aucun resultat pour "{echapper_html(recherche_objet)}".</div>')
-        if liste_suggestions:
-            print('<div class="suggestions">')
-            for s in liste_suggestions:
-                lien_s = (
-                    f"/cgi-bin/liaison.py?uid={uid_encode}"
-                    f"&recherche_objet={urllib.parse.quote(s)}"
-                    f"&selection_ids={urllib.parse.quote(selection_ids_texte)}"
-                    f"&objet_source_id={urllib.parse.quote(objet_source_str)}"
-                    f"&evenement_id={urllib.parse.quote(evenement_id_str)}"
-                )
-                print(f'<a class="suggestion" href="{lien_s}">{echapper_html(s)}</a>')
-            print("</div>")
+        lien_vider = "/cgi-bin/liaison.py?" + etat + "&action=vider_cibles"
+        print(f'<div class="ligne-actions"><a class="bouton bouton-secondaire" href="{lien_vider}">Vider les cibles</a></div>')
 
-# Selection
-print("<h2 style='margin-top:22px;'>Selection</h2>")
-print('<div class="message">La selection sert a: lier, preview, creer evenement.</div>')
-if not selection_ids:
-    print('<div class="message">Selection vide.</div>')
-else:
-    print('<div class="zone-resultats">')
-    for oid in selection_ids:
-        nom_o = recuperer_nom_objet(connexion, colonne_id, colonne_nom, oid)
-        lien_retire = (
-            f"/cgi-bin/liaison.py?uid={uid_encode}"
-            f"&action=retirer_selection"
-            f"&objet_retire_id={oid}"
-            f"&recherche_objet={urllib.parse.quote(recherche_objet)}"
-            f"&selection_ids={urllib.parse.quote(selection_ids_texte)}"
-            f"&objet_source_id={urllib.parse.quote(objet_source_str)}"
-            f"&evenement_id={urllib.parse.quote(evenement_id_str)}"
-        )
-        print(f"""
-          <div class="ligne-resultat">
-            <div>
-              <strong>{echapper_html(nom_o)}</strong>
-              <span class="petit">(# {echapper_html(oid)})</span>
-            </div>
-            <a class="bouton bouton-secondaire" href="{lien_retire}">Retirer</a>
-          </div>
-        """)
-    print("</div>")
+    print("""
+      </div> <!-- fin carte gauche -->
+    """)
 
-print("""
-    </div>
-
-    <!-- Colonne droite -->
-    <div>
+    # Colonne droite: creation liaison (boutons en priorite)
+    print(f"""
+      <!-- ===============================
+           Colonne droite: Creation liaison
+           =============================== -->
       <div class="carte">
-        <h2>1) Lier des objets (reseau)</h2>
-        <div class="message">1) Definis une source  2) Ajoute des objets  3) Clique "Lier".</div>
-""")
+        <h2>2) Creer la liaison</h2>
 
-# Bloc source
-if objet_source_id is None:
-    print('<div class="message bad">Aucun objet source. Utilise "Definir source" dans les resultats.</div>')
-else:
-    print(f'<div class="message ok">Source : <strong>{echapper_html(nom_objet_source)}</strong> <span class="petit">(# {echapper_html(objet_source_id)})</span></div>')
+        <div class="message">
+          <strong>Implication</strong> = direction de propagation (structure).<br>
+          <strong>Precision</strong> (optionnel) = details (poids, type de lien, commentaire).
+        </div>
 
-# Form liaison
-print(f"""
-        <form method="get" action="/cgi-bin/liaison.py" style="margin-top:12px;">
-          <input type="hidden" name="uid" value="{echapper_html(uid)}">
-          <input type="hidden" name="action" value="lier_objets">
-          <input type="hidden" name="selection_ids" value="{echapper_html(selection_ids_texte)}">
-          <input type="hidden" name="recherche_objet" value="{echapper_html(recherche_objet)}">
-          <input type="hidden" name="objet_source_id" value="{echapper_html(objet_source_str)}">
-          <input type="hidden" name="evenement_id" value="{echapper_html(evenement_id_str)}">
-
-          <label class="label">Type de lien</label>
-          <select class="champ-select" name="type_lien">
-            <option value="associe">associe</option>
-            <option value="compose">compose</option>
-            <option value="depend">depend</option>
-            <option value="influence">influence</option>
-            <option value="cause">cause</option>
-            <option value="oppose">oppose</option>
-          </select>
-
-          <details>
-            <summary>Options (facultatif)</summary>
-            <label class="label">Poids de liaison</label>
-            <input class="champ-texte" type="text" name="poids_liaison" value="1.0">
-
-            <label class="label">Commentaire</label>
-            <input class="champ-texte" type="text" name="commentaire_liaison" placeholder="Optionnel">
-          </details>
-
-          <div class="ligne-actions">
-            <button class="bouton" type="submit">Lier la selection a la source</button>
-          </div>
-        </form>
-""")
-
-# Liste liaisons source
-if objet_source_id is not None:
-    if not liaisons_objets_source:
-        print('<div class="message" style="margin-top:10px;">Aucune liaison pour ce source.</div>')
-    else:
-        print('<details style="margin-top:12px;">')
-        print('<summary>Voir les liaisons du source</summary>')
-        print('<table class="table">')
-        print('<tr><th>Cible</th><th>Type</th><th>Poids</th><th></th></tr>')
-        for (lid, cible_id, type_lien, poids, comm, datec) in liaisons_objets_source:
-            nom_cible = recuperer_nom_objet(connexion, colonne_id, colonne_nom, cible_id)
-            lien_suppr = (
-                f"/cgi-bin/liaison.py?uid={uid_encode}"
-                f"&action=supprimer_liaison_objet"
-                f"&liaison_id={lid}"
-                f"&selection_ids={urllib.parse.quote(selection_ids_texte)}"
-                f"&recherche_objet={urllib.parse.quote(recherche_objet)}"
-                f"&objet_source_id={urllib.parse.quote(objet_source_str)}"
-                f"&evenement_id={urllib.parse.quote(evenement_id_str)}"
-            )
-            print(f"""
-              <tr>
-                <td>{echapper_html(nom_cible)} <span class="petit">(# {echapper_html(cible_id)})</span></td>
-                <td>{echapper_html(type_lien)}</td>
-                <td>{echapper_html(poids)}</td>
-                <td><a class="lien-supprimer" href="{lien_suppr}">Supprimer</a></td>
-              </tr>
-            """)
-        print("</table>")
-        print("</details>")
-
-# ETAPE 2
-print(f"""
-      </div>
-
-      <div class="carte" style="margin-top:20px;">
-        <h2>2) Evenements (impact + propagation)</h2>
-        <div class="message">Selection = objets touches (niveau 0). Propagation calculee ensuite.</div>
-
+        <!-- Form creation (GET) -->
         <form method="get" action="/cgi-bin/liaison.py">
           <input type="hidden" name="uid" value="{echapper_html(uid)}">
-          <input type="hidden" name="selection_ids" value="{echapper_html(selection_ids_texte)}">
-          <input type="hidden" name="recherche_objet" value="{echapper_html(recherche_objet)}">
-          <input type="hidden" name="objet_source_id" value="{echapper_html(objet_source_str)}">
-          <input type="hidden" name="action" value="ouvrir_evenement">
+          <input type="hidden" name="type_applicable" value="{echapper_html(type_applicable)}">
+          <input type="hidden" name="vue" value="liaison">
 
-          <label class="label">Evenement a ouvrir</label>
-          <select class="champ-select" name="evenement_choisi_id">
-""")
+          <!-- Conserver selections -->
+          <input type="hidden" name="source_id" value="{echapper_html('' if source_id is None else str(source_id))}">
+          <input type="hidden" name="cibles_ids" value="{echapper_html(cibles_ids_str)}">
+          <input type="hidden" name="recherche" value="{echapper_html(texte_recherche)}">
 
-# Options du dropdown evenements
-if liste_evenements:
-    for (eid, nom_evt, pg, it, du, pr, tg, dc) in liste_evenements:
-        sel = "selected" if evenement_id == eid else ""
-        print(f'<option value="{eid}" {sel}>{echapper_html(nom_evt)} (# {eid})</option>')
-else:
-    print('<option value="">Aucun evenement</option>')
+          <label class="label">Implication (obligatoire)</label>
+          <div class="ligne-actions" style="justify-content:flex-start;">
+            <!-- Deux boutons: on simule un "radio" sans JS -->
+            <a class="bouton {'bouton-secondaire' if implication!='->' else ''}"
+               href="/cgi-bin/liaison.py?{etat}&implication=->">Implication (->)</a>
 
-print(f"""
-          </select>
-
-          <div class="ligne-actions">
-            <button class="bouton bouton-secondaire" type="submit">Ouvrir</button>
+            <a class="bouton {'bouton-secondaire' if implication!='<->' else ''}"
+               href="/cgi-bin/liaison.py?{etat}&implication=%3C-%3E">Equivalence (<->)</a>
           </div>
-        </form>
 
-        <h2 style="margin-top:18px;">Creer un evenement</h2>
-
-        <form method="get" action="/cgi-bin/liaison.py">
-          <input type="hidden" name="uid" value="{echapper_html(uid)}">
-          <input type="hidden" name="selection_ids" value="{echapper_html(selection_ids_texte)}">
-          <input type="hidden" name="recherche_objet" value="{echapper_html(recherche_objet)}">
-          <input type="hidden" name="objet_source_id" value="{echapper_html(objet_source_str)}">
-          <input type="hidden" name="evenement_id" value="{echapper_html(evenement_id_str)}">
-
-          <label class="label">Nom</label>
-          <input class="champ-texte" type="text" name="nom_evenement" value="{echapper_html(nom_evenement)}" placeholder="Ex: Guerre froide">
-
-          <label class="label">Poids global</label>
-          <input class="champ-texte" type="text" name="poids_global" value="{echapper_html(poids_global_str)}">
-
-          <label class="label">Intensite</label>
-          <input class="champ-texte" type="text" name="intensite" value="{echapper_html(intensite_str)}">
-
+          <!-- Precision optionnelle (pliee) -->
           <details>
-            <summary>Options avancees (facultatif)</summary>
+            <summary>Precision (optionnel)</summary>
 
-            <label class="label">Duree</label>
-            <input class="champ-texte" type="text" name="duree" value="{echapper_html(duree_str)}">
-
-            <label class="label">Probabilite (0..1)</label>
-            <input class="champ-texte" type="text" name="probabilite" value="{echapper_html(probabilite_str)}">
-
-            <label class="label">Tags</label>
-            <input class="champ-texte" type="text" name="tags" value="{echapper_html(tags)}">
-
-            <label class="label">Description</label>
-            <textarea name="description">{echapper_html(description)}</textarea>
-
-            <label class="label">Role</label>
-            <select class="champ-select" name="role">
-              <option value="impacte" {"selected" if role=="impacte" else ""}>impacte</option>
-              <option value="cause" {"selected" if role=="cause" else ""}>cause</option>
-              <option value="amplifie" {"selected" if role=="amplifie" else ""}>amplifie</option>
-              <option value="attenue" {"selected" if role=="attenue" else ""}>attenue</option>
+            <label class="label">Type de lien</label>
+            <select class="champ-select" name="type_lien">
+              <option value="associe" {"selected" if type_lien=="associe" else ""}>associe (defaut)</option>
+              <option value="depend" {"selected" if type_lien=="depend" else ""}>depend</option>
+              <option value="compose" {"selected" if type_lien=="compose" else ""}>compose</option>
+              <option value="cause" {"selected" if type_lien=="cause" else ""}>cause</option>
+              <option value="oppose" {"selected" if type_lien=="oppose" else ""}>oppose</option>
+              <option value="influence" {"selected" if type_lien=="influence" else ""}>influence</option>
             </select>
 
-            <label class="label">Poids sur selection (niveau 0)</label>
-            <input class="champ-texte" type="text" name="poids_lien" value="{echapper_html(poids_lien_str)}">
+            <label class="label">Poids</label>
+            <input class="champ-texte" type="text" name="poids" value="{echapper_html(poids_str)}" placeholder="1.0">
 
-            <label class="label">Profondeur max</label>
-            <input class="champ-texte" type="text" name="profondeur_max" value="{echapper_html(profondeur_max_str)}">
-
-            <label class="label">Attenuation (0..1)</label>
-            <input class="champ-texte" type="text" name="attenuation" value="{echapper_html(attenuation_str)}">
+            <label class="label">Commentaire</label>
+            <input class="champ-texte" type="text" name="commentaire" value="{echapper_html(commentaire)}" placeholder="Optionnel">
           </details>
 
+          <!-- Bouton principal (priorite) -->
           <div class="ligne-actions">
-            <button class="bouton bouton-secondaire" type="submit" name="action" value="previsualiser_evenement">Preview</button>
-            <button class="bouton" type="submit" name="action" value="creer_evenement">Creer</button>
+            <button class="bouton" type="submit" name="action" value="creer_liaison">Creer la liaison</button>
           </div>
 
           <div class="message" style="margin-top:10px;">
-            Poids depart = poids_global * intensite * poids_lien, puis attenuation^niveau.
+            Astuce: si tu ne maitrises pas la precision, n ouvre pas le bloc.
+            Par defaut: <strong>associe</strong>, poids <strong>1.0</strong>.
           </div>
         </form>
-""")
 
-# Preview impacts
-if preview_impacts is not None:
-    items = list(preview_impacts.items())
-    items.sort(key=lambda x: (x[1][0], -x[1][1]))
+        <div class="message" style="margin-top:10px;">
+          Tu veux voir le resultat comme "R1: S(a,b) -> C <-> X" ? Clique sur <strong>Voir les reseaux</strong>.
+        </div>
 
-    print('<details open style="margin-top:12px;">')
-    print('<summary>Resultat du preview</summary>')
-    print('<table class="table">')
-    print('<tr><th>Objet</th><th>Niveau</th><th>Poids final</th></tr>')
-    for oid, (niv, pfinal) in items[:150]:
-        nom_o = recuperer_nom_objet(connexion, colonne_id, colonne_nom, oid)
-        print(f"""
+      </div> <!-- fin carte droite -->
+
+    </div> <!-- fin grille -->
+    """)
+
+# ============================================================
+# VUE 2: "reseaux" (chef d'oeuvre: resume lisible par reseau)
+# ============================================================
+elif vue == "reseaux":
+    print("""
+    <div class="carte" style="margin-top:18px;">
+      <h2>Voir les reseaux</h2>
+
+      <div class="message">
+        Chaque reseau (R1, R2...) est construit automatiquement a partir des liaisons.
+        Exemple: <strong>R1: S(stylo, mur) -> Stylos 4 couleurs <-> Barre de fer</strong>
+      </div>
+    """)
+
+    if not reseaux_ids:
+        print('<div class="message">Aucun reseau pour le moment. Cree une liaison pour commencer.</div>')
+    else:
+        # On affiche une liste de "cartes" reseau (sans JS, juste du HTML)
+        for rid in reseaux_ids:
+            # Construire un texte lisible
+            texte = resumer_reseau_lisible(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, rid)
+
+            # Nombre de liaisons dans le reseau (utile pour savoir si c'est vide)
+            nb_liaisons = 0
+            try:
+                nb_liaisons = len(liaisons_par_reseau(connexion, type_applicable, rid))
+            except Exception:
+                nb_liaisons = 0
+
+            # On ignore les reseaux totalement vides (cas rare)
+            if nb_liaisons <= 0:
+                continue
+
+            print(f"""
+              <details style="margin-top:12px;">
+                <summary><strong>R{echapper_html(rid)}</strong> &nbsp; <span class="petit">{echapper_html(nb_liaisons)} liaison(s)</span></summary>
+
+                <div class="message" style="margin-top:10px;">
+                  <strong>R{echapper_html(rid)}:</strong> {echapper_html(texte)}
+                </div>
+
+                <div class="petit">
+                  Note: ce resume est un "aperçu lisible". La simulation utilisera les liaisons exactes.
+                </div>
+              </details>
+            """)
+
+    print("</div>")  # fin carte
+
+# ============================================================
+# VUE 3: "liste" (table brute, suppression)
+# ============================================================
+else:
+    print("""
+    <div class="carte" style="margin-top:18px;">
+      <h2>Liste des liaisons</h2>
+
+      <div class="message">
+        Vue brute (utile pour debug et suppression).
+        La simulation lira ces lignes telles quelles.
+      </div>
+    """)
+
+    if not liaisons_recentes:
+        print('<div class="message">Aucune liaison.</div>')
+    else:
+        print("""
+        <table class="table">
           <tr>
-            <td>{echapper_html(nom_o)} <span class="petit">(# {echapper_html(oid)})</span></td>
-            <td>{echapper_html(niv)}</td>
-            <td>{echapper_html(round(pfinal, 6))}</td>
+            <th>ID</th>
+            <th>Reseau</th>
+            <th>Source</th>
+            <th>Cible</th>
+            <th>Implication</th>
+            <th>Precision</th>
+            <th></th>
           </tr>
         """)
-    print("</table>")
-    if len(items) > 150:
-        print('<div class="message">Preview limite a 150 lignes.</div>')
-    print("</details>")
 
-# Impacts evenement ouvert
-if evenement_id is not None:
-    if not impacts_evenement:
-        print('<div class="message" style="margin-top:12px;">Aucun impact enregistre pour cet evenement.</div>')
-    else:
-        print('<details style="margin-top:12px;">')
-        print('<summary>Voir les impacts enregistres de l evenement ouvert</summary>')
-        print('<table class="table">')
-        print('<tr><th>Objet</th><th>Niveau</th><th>Poids</th><th>Origine</th><th></th></tr>')
-        for (iid, oid, niv, pfinal, r, origine, comm, dc) in impacts_evenement[:250]:
-            nom_o = recuperer_nom_objet(connexion, colonne_id, colonne_nom, oid)
-            lien_suppr = (
-                f"/cgi-bin/liaison.py?uid={uid_encode}"
-                f"&action=supprimer_impact"
-                f"&impact_id={iid}"
-                f"&evenement_id={evenement_id}"
-                f"&selection_ids={urllib.parse.quote(selection_ids_texte)}"
-                f"&recherche_objet={urllib.parse.quote(recherche_objet)}"
-                f"&objet_source_id={urllib.parse.quote(objet_source_str)}"
-            )
+        for (lid, rid, sid, cid, impl, tl, pw, comm, dc) in liaisons_recentes:
+            lib_source = nom_element_affichage(type_applicable, sid)
+            lib_cible = nom_element_affichage(type_applicable, cid)
+
+            # Lien suppression (conserve etat)
+            lien_suppr = "/cgi-bin/liaison.py?" + etat + "&action=supprimer_liaison&liaison_id=" + str(lid)
+
+            # Petit bloc precision lisible
+            precision_txt = (tl or "associe") + " / " + str(pw)
+            if (comm or "").strip():
+                precision_txt += " / " + comm.strip()
+
             print(f"""
               <tr>
-                <td>{echapper_html(nom_o)} <span class="petit">(# {echapper_html(oid)})</span></td>
-                <td>{echapper_html(niv)}</td>
-                <td>{echapper_html(round(pfinal, 6))}</td>
-                <td>{echapper_html(origine)}</td>
+                <td>{echapper_html(lid)}</td>
+                <td>R{echapper_html(rid)}</td>
+                <td>{echapper_html(lib_source)}</td>
+                <td>{echapper_html(lib_cible)}</td>
+                <td>{echapper_html(impl)}</td>
+                <td class="petit">{echapper_html(precision_txt)}</td>
                 <td><a class="lien-supprimer" href="{lien_suppr}">Supprimer</a></td>
               </tr>
             """)
-        print("</table>")
-        if len(impacts_evenement) > 250:
-            print('<div class="message">Affichage limite a 250 lignes.</div>')
-        print("</details>")
 
+        print("</table>")
+
+    print("</div>")  # fin carte
+
+# ============================================================
+# Fin page
+# ============================================================
 print("""
-      </div>
-    </div>
-  </div>
-</div>
+</div> <!-- fin panel -->
 </body>
 </html>
 """)

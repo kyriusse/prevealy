@@ -157,7 +157,7 @@ panels = [
             "Simulation deterministe basee sur prix, quantites et coefficients. "
             "Calcule total moyen, min/max et projection a N annees."
         ),
-        "fichier": "sim_calc.py"
+        "fichier": "sim.py"
     },
     {
         "titre": "Simulation Monte Carlo",
@@ -192,10 +192,8 @@ print(f"""
 
 <style>
 /* ============================================================
-   THEME "MYSTIQUE" (plus profond que la version precedente)
    - Couleurs: noir/violet + or discret
    - Atmosphere: brume + halo + lueurs
-   - Toujours sans image obligatoire (sauf bouton retour)
    ============================================================ */
 
 /* ----- Fond global: plusieurs couches pour donner un effet "rituel" ----- */
