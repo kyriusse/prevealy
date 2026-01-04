@@ -2,11 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-liaison.py
-----------
+
 PAGE "LIAISON / RESEAUX" (univers)
 
-Objectif (version "chef d'oeuvre NSI" mais simple a utiliser):
 - Creer des liaisons entre "applicables" du meme type:
   - Type O: objets (table stat_objects)
   - Type E: evenements (table evenements, creee ici; evenement.py l'alimentera plus tard)
@@ -814,7 +812,7 @@ etat = url_etat_commun()
 # Liens navigation (haut de page)
 # ============================================================
 lien_retour_univers = "/cgi-bin/univers_dashboard.py?uid=" + uid_encode
-lien_menu_simulation = "/cgi-bin/simulation.py?uid=" + uid_encode
+lien_menu_simulation = "/cgi-bin/menu_simulation.py?uid=" + uid_encode
 lien_evenement = "/cgi-bin/evenement.py?uid=" + uid_encode  # a coder plus tard
 
 
