@@ -181,6 +181,27 @@ def voisins_objet(connexion, objet_id):
     """
     cur = connexion.cursor()
     try:
+        # Priorite: table liaisons_applicables (nouveau)
+        cur.execute(
+            """
+            SELECT source_id, cible_id, implication
+            FROM liaisons_applicables
+            WHERE type_applicable = 'O' AND (source_id = ? OR cible_id = ?)
+            """,
+            (objet_id, objet_id)
+        )
+        voisins = []
+        for sid, cid, impl in cur.fetchall():
+            if sid == objet_id:
+                voisins.append(cid)
+            elif impl == "<->" and cid == objet_id:
+                voisins.append(sid)
+        if voisins:
+            return list(dict.fromkeys(voisins))
+    except Exception:
+        pass
+
+    try:
         cur.execute(
             "SELECT cible_objet_id FROM liaisons_objets WHERE source_objet_id = ?",
             (objet_id,)
@@ -284,10 +305,24 @@ def lire_impacts_evenement(connexion, evenement_id):
     """
     Lit la table impacts_evenements (cree par liaison.py).
     Retour:
-    - dict objet_id -> poids_final
+    - dict objet_id -> poids_final (probabilite incluse si disponible)
     """
     cur = connexion.cursor()
     try:
+        # Support colonne probabilite si presente
+        cur.execute("PRAGMA table_info(impacts_evenements)")
+        colonnes = [c[1] for c in cur.fetchall()]
+        if "probabilite" in colonnes:
+            cur.execute(
+                "SELECT objet_id, poids_final, probabilite FROM impacts_evenements WHERE evenement_id = ?",
+                (evenement_id,)
+            )
+            d = {}
+            for oid, p, prob in cur.fetchall():
+                poids = _float_robuste(p, 1.0)
+                probabilite = _float_robuste(prob, 1.0)
+                d[oid] = max(0.0, min(1.0, poids * probabilite))
+            return d
         cur.execute(
             "SELECT objet_id, poids_final FROM impacts_evenements WHERE evenement_id = ?",
             (evenement_id,)
@@ -298,6 +333,70 @@ def lire_impacts_evenement(connexion, evenement_id):
         return d
     except Exception:
         return {}
+
+
+def lire_parametres_evenement(connexion, evenement_id):
+    """Lit la table parametres_evenements sous forme dict."""
+    cur = connexion.cursor()
+    try:
+        cur.execute(
+            "SELECT cle, valeur FROM parametres_evenements WHERE evenement_id = ? ORDER BY ordre ASC",
+            (evenement_id,)
+        )
+        d = {}
+        for cle, val in cur.fetchall():
+            if cle:
+                d[str(cle)] = val
+        return d
+    except Exception:
+        return {}
+
+
+def _ids_depuis_chaine(chaine):
+    """Transforme '1,2,3' -> [1,2,3]."""
+    resultat = []
+    for morceau in (chaine or "").split(","):
+        m = morceau.strip()
+        if m.isdigit():
+            v = int(m)
+            if v not in resultat:
+                resultat.append(v)
+    return resultat
+
+
+def _lister_tous_objets(connexion, colonnes):
+    """Liste tous les ids d objets."""
+    if not colonnes.get("id"):
+        return []
+    cur = connexion.cursor()
+    try:
+        cur.execute("SELECT [{}] FROM stat_objects".format(colonnes["id"]))
+        return [r[0] for r in cur.fetchall()]
+    except Exception:
+        return []
+
+
+def determiner_impacts_depuis_parametres(connexion, colonnes, params):
+    """
+    Construit un dict objet_id -> poids (1.0) a partir des parametres Ep.
+    """
+    if not params:
+        return {}
+    portee = str(params.get("appliquer_portee", "tout") or "tout")
+    ids = []
+    if portee == "liste":
+        ids = _ids_depuis_chaine(params.get("appliquer_objets_ids", ""))
+    elif portee == "famille":
+        ids = lister_ids_objets_par_famille(connexion, colonnes, params.get("appliquer_famille", ""))
+    elif portee == "type":
+        ids = lister_ids_objets_par_type(connexion, colonnes, params.get("appliquer_type", ""))
+    else:
+        ids = _lister_tous_objets(connexion, colonnes)
+
+    impacts = {}
+    for oid in ids:
+        impacts[oid] = 1.0
+    return impacts
 
 
 def _extraire_valeur_evt(evt, *noms_possibles, defaut=None):
@@ -455,7 +554,10 @@ def appliquer_evenement_parametrique(
     impacts,
     propagation,
     coef_prix=1.0,
-    coef_ca=1.0
+    coef_ca=1.0,
+    action_param="coef_evolution",
+    valeur_param=1.0,
+    probabilite_evt=1.0
 ):
     """
     Applique un evenement parametrie.
@@ -476,6 +578,28 @@ def appliquer_evenement_parametrique(
     if not impacts:
         return
 
+    # Adapter coefficients selon action
+    coef_prix_action = coef_prix
+    coef_ca_action = coef_ca
+    delta_prix = 0.0
+
+    if action_param == "coef_evolution":
+        coef_prix_action *= _float_robuste(valeur_param, 1.0)
+        coef_ca_action *= _float_robuste(valeur_param, 1.0)
+    elif action_param == "mult_prix_moyen":
+        coef_prix_action *= _float_robuste(valeur_param, 1.0)
+    elif action_param == "delta_prix_moyen":
+        delta_prix = _float_robuste(valeur_param, 0.0)
+    elif action_param == "mult_CA":
+        coef_ca_action *= _float_robuste(valeur_param, 1.0)
+
+    # Probabilite (on la traduit en poids)
+    prob_evt = _float_robuste(probabilite_evt, 1.0)
+    if prob_evt < 0.0:
+        prob_evt = 0.0
+    if prob_evt > 1.0:
+        prob_evt = 1.0
+
     for oid, poids_impact in impacts.items():
         if oid not in etat:
             # Si l objet n est pas dans la projection, on ignore (on reste deterministe)
@@ -486,7 +610,7 @@ def appliquer_evenement_parametrique(
         if propagation and oid in propagation:
             poids_reseau = _float_robuste(propagation[oid][1], 1.0)
 
-        poids_total = _float_robuste(poids_impact, 1.0) * poids_reseau
+        poids_total = _float_robuste(poids_impact, 1.0) * poids_reseau * prob_evt
         if poids_total < 0.0:
             poids_total = 0.0
         if poids_total > 1.0:
@@ -494,13 +618,13 @@ def appliquer_evenement_parametrique(
             poids_total = 1.0
 
         # Coeff local prix / ca
-        coef_local_prix = 1.0 + (coef_prix - 1.0) * poids_total
-        coef_local_ca = 1.0 + (coef_ca - 1.0) * poids_total
+        coef_local_prix = 1.0 + (coef_prix_action - 1.0) * poids_total
+        coef_local_ca = 1.0 + (coef_ca_action - 1.0) * poids_total
 
         # Appliquer a l etat
-        etat[oid]["prix_moyen"] = max(0.0, etat[oid]["prix_moyen"] * coef_local_prix)
-        etat[oid]["prix_min"] = max(0.0, etat[oid]["prix_min"] * coef_local_prix)
-        etat[oid]["prix_max"] = max(0.0, etat[oid]["prix_max"] * coef_local_prix)
+        etat[oid]["prix_moyen"] = max(0.0, etat[oid]["prix_moyen"] * coef_local_prix + delta_prix * poids_total)
+        etat[oid]["prix_min"] = max(0.0, etat[oid]["prix_min"] * coef_local_prix + delta_prix * poids_total)
+        etat[oid]["prix_max"] = max(0.0, etat[oid]["prix_max"] * coef_local_prix + delta_prix * poids_total)
         etat[oid]["ca"] = max(0.0, etat[oid]["ca"] * coef_local_ca)
 
 
@@ -608,6 +732,16 @@ def executer_simulation(
             for (eid, coef_prix, coef_ca) in planning_index[pas]:
                 evt = lire_evenement(connexion, eid)
                 impacts = lire_impacts_evenement(connexion, eid)
+                params_evt = lire_parametres_evenement(connexion, eid)
+
+                # Si impacts absents, on tente de les deduire des parametres Ep
+                if not impacts:
+                    impacts = determiner_impacts_depuis_parametres(connexion, colonnes, params_evt)
+
+                # Parametres Ep utiles
+                action_param = params_evt.get("action", "coef_evolution") if params_evt else "coef_evolution"
+                valeur_param = params_evt.get("valeur", "1.0") if params_evt else "1.0"
+                probabilite_evt = params_evt.get("probabilite", "1.0") if params_evt else "1.0"
 
                 # Si l utilisateur a lie l evenement a une selection, on propage depuis les "objets touches"
                 # Dans impacts_evenements, les objets niveau 0 sont deja dedans, mais on veut aussi tenir compte du reseau
@@ -621,7 +755,10 @@ def executer_simulation(
                     impacts=impacts,
                     propagation=propagation,
                     coef_prix=coef_prix,
-                    coef_ca=coef_ca
+                    coef_ca=coef_ca,
+                    action_param=action_param,
+                    valeur_param=valeur_param,
+                    probabilite_evt=probabilite_evt
                 )
 
         # 3) enregistrer courbes

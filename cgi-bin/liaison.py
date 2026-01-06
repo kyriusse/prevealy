@@ -157,7 +157,7 @@ def detecter_colonnes_stat_objects(connexion):
 
 
 # ============================================================
-# BDD: creation tables (evenements + reseaux + liaisons)
+# BDD: creation tables (evenements + reseaux + liaisons + paternes)
 # ============================================================
 def creer_tables_si_besoin(connexion):
     """
@@ -176,6 +176,11 @@ def creer_tables_si_besoin(connexion):
        - reseau_id permet de regrouper / retrouver vite les reseaux
        - implication ('->' ou '<->') definit la direction
        - precision (type_lien, poids, commentaire) est optionnelle
+       - probabilite (optionnelle): utile pour les liaisons d'evenements
+
+    4) paternes:
+       - objet "paterne" simple (type suite)
+       - utile hors simulation (structure + liaison)
     """
     cur = connexion.cursor()
 
@@ -217,6 +222,7 @@ def creer_tables_si_besoin(connexion):
             -- Precision optionnelle (si non maitrise, laisser valeurs par defaut)
             type_lien TEXT NOT NULL DEFAULT 'associe',  -- associe / depend / compose / etc.
             poids REAL NOT NULL DEFAULT 1.0,            -- coefficient de force (simulation plus tard)
+            probabilite REAL NOT NULL DEFAULT 1.0,      -- probabilite d'activation (evenements, etc.)
             commentaire TEXT NOT NULL DEFAULT '',
 
             date_creation TEXT DEFAULT (datetime('now'))
@@ -227,6 +233,27 @@ def creer_tables_si_besoin(connexion):
     cur.execute("CREATE INDEX IF NOT EXISTS idx_liaisons_type_reseau ON liaisons_applicables(type_applicable, reseau_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_liaisons_source ON liaisons_applicables(type_applicable, source_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_liaisons_cible ON liaisons_applicables(type_applicable, cible_id)")
+
+    # Table paternes (objet hors simulation)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS paternes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nom TEXT NOT NULL,
+            type_paterne TEXT NOT NULL DEFAULT 'suite',
+            formule TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL DEFAULT '',
+            date_creation TEXT DEFAULT (datetime('now'))
+        )
+    """)
+
+    # Migration douce: colonne probabilite si ancienne version
+    cur.execute("PRAGMA table_info(liaisons_applicables)")
+    colonnes = [r[1] for r in cur.fetchall()]
+    if "probabilite" not in colonnes:
+        try:
+            cur.execute("ALTER TABLE liaisons_applicables ADD COLUMN probabilite REAL NOT NULL DEFAULT 1.0")
+        except Exception:
+            pass
 
     connexion.commit()
 
@@ -287,6 +314,48 @@ def nom_evenement_par_id(connexion, evenement_id):
     """Nom d'un evenement via id."""
     cur = connexion.cursor()
     cur.execute("SELECT nom FROM evenements WHERE id = ?", (evenement_id,))
+    row = cur.fetchone()
+    return row[0] if row and row[0] is not None else ""
+
+
+# ============================================================
+# BDD: paternes (recherche + nom)
+# ============================================================
+def creer_paterne(connexion, nom, type_paterne, formule, description):
+    """Cree un paterne simple."""
+    cur = connexion.cursor()
+    cur.execute(
+        """
+        INSERT INTO paternes (nom, type_paterne, formule, description)
+        VALUES (?, ?, ?, ?)
+        """,
+        (nom, type_paterne or "suite", formule or "", description or "")
+    )
+    connexion.commit()
+    return cur.lastrowid
+
+
+def rechercher_paternes(connexion, texte, limite=25):
+    """Recherche LIKE sur nom ou formule."""
+    cur = connexion.cursor()
+    motif = "%" + (texte or "").strip() + "%"
+    cur.execute(
+        """
+        SELECT id, nom, type_paterne, formule
+        FROM paternes
+        WHERE (nom LIKE ? OR formule LIKE ?)
+        ORDER BY nom COLLATE NOCASE
+        LIMIT ?
+        """,
+        (motif, motif, limite)
+    )
+    return cur.fetchall()
+
+
+def nom_paterne_par_id(connexion, paterne_id):
+    """Nom d'un paterne via id."""
+    cur = connexion.cursor()
+    cur.execute("SELECT nom FROM paternes WHERE id = ?", (paterne_id,))
     row = cur.fetchone()
     return row[0] if row and row[0] is not None else ""
 
@@ -387,7 +456,7 @@ def choisir_reseau_pour_nouvelle_liaison(connexion, type_applicable, source_id, 
 # BDD: liaisons (insert / delete / list)
 # ============================================================
 def inserer_liaison(connexion, type_applicable, reseau_id, source_id, cible_id,
-                    implication, type_lien, poids, commentaire):
+                    implication, type_lien, poids, probabilite, commentaire):
     """Insertion d'une liaison (simple) dans le reseau cible."""
     cur = connexion.cursor()
     cur.execute(
@@ -395,11 +464,11 @@ def inserer_liaison(connexion, type_applicable, reseau_id, source_id, cible_id,
         INSERT INTO liaisons_applicables (
             type_applicable, reseau_id,
             source_id, cible_id,
-            implication, type_lien, poids, commentaire
+            implication, type_lien, poids, probabilite, commentaire
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (type_applicable, reseau_id, source_id, cible_id, implication, type_lien, poids, commentaire)
+        (type_applicable, reseau_id, source_id, cible_id, implication, type_lien, poids, probabilite, commentaire)
     )
     connexion.commit()
 
@@ -426,7 +495,7 @@ def lister_liaisons(connexion, type_applicable, limite=250):
     cur = connexion.cursor()
     cur.execute(
         """
-        SELECT id, reseau_id, source_id, cible_id, implication, type_lien, poids, commentaire, date_creation
+        SELECT id, reseau_id, source_id, cible_id, implication, type_lien, poids, probabilite, commentaire, date_creation
         FROM liaisons_applicables
         WHERE type_applicable = ?
         ORDER BY id DESC
@@ -457,7 +526,7 @@ def liaisons_par_reseau(connexion, type_applicable, reseau_id):
     cur = connexion.cursor()
     cur.execute(
         """
-        SELECT id, source_id, cible_id, implication, type_lien, poids, commentaire
+        SELECT id, source_id, cible_id, implication, type_lien, poids, probabilite, commentaire
         FROM liaisons_applicables
         WHERE type_applicable = ? AND reseau_id = ?
         ORDER BY id ASC
@@ -474,6 +543,9 @@ def nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet,
     """Nom lisible d'un element selon type (objet / evenement)."""
     if type_applicable == "O":
         n = nom_objet_par_id(connexion, colonne_id_objet, colonne_nom_objet, element_id)
+        return (n or "").strip()
+    if type_applicable == "P":
+        n = nom_paterne_par_id(connexion, element_id)
         return (n or "").strip()
     n = nom_evenement_par_id(connexion, element_id)
     return (n or "").strip()
@@ -502,16 +574,21 @@ def resumer_reseau_lisible(type_applicable, connexion, colonne_id_objet, colonne
         return "Reseau vide."
 
     # Comptage des implications vers chaque cible
-    sources_par_cible = {}  # cible_id -> set(source_id)
-    equivalences = []       # (a,b) pour <->
+    sources_par_cible = {}  # cible_id -> dict(source_id -> info)
+    equivalences = []       # (a,b, info) pour <->
 
-    for (_lid, sid, cid, impl, _tl, _pw, _comm) in liaisons:
+    for (_lid, sid, cid, impl, _tl, _pw, _prob, _comm) in liaisons:
+        info = {
+            "poids": _pw,
+            "probabilite": _prob
+        }
         if impl == "<->":
-            equivalences.append((sid, cid))
+            equivalences.append((sid, cid, info))
             # Une equivalence peut aussi servir de "connexion",
             # mais on la montrera a part pour garder un texte clair.
         else:
-            sources_par_cible.setdefault(cid, set()).add(sid)
+            sources_par_cible.setdefault(cid, {})
+            sources_par_cible[cid][sid] = info
 
     # Cibles triees: celles qui ont le plus de sources en premier
     cibles_triees = sorted(sources_par_cible.keys(), key=lambda c: (-len(sources_par_cible[c]), c))
@@ -523,47 +600,73 @@ def resumer_reseau_lisible(type_applicable, connexion, colonne_id_objet, colonne
     deja = set()
 
     for cible_id in cibles_triees:
-        sources = sorted(list(sources_par_cible[cible_id]))
+        sources = sorted(list(sources_par_cible[cible_id].keys()))
         nom_cible = nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, cible_id) or ("#" + str(cible_id))
 
         if len(sources) >= 2:
             noms_sources = []
             for sid in sources:
-                noms_sources.append(nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, sid) or ("#" + str(sid)))
+                info = sources_par_cible[cible_id].get(sid, {})
+                nom_source = nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, sid) or ("#" + str(sid))
+                noms_sources.append(nom_source + _detail_lien(info))
                 deja.add(sid)
             deja.add(cible_id)
             segments.append("S(" + ", ".join(noms_sources) + ") -> " + nom_cible)
         elif len(sources) == 1:
             sid = sources[0]
+            info = sources_par_cible[cible_id].get(sid, {})
             nom_source = nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, sid) or ("#" + str(sid))
             deja.add(sid)
             deja.add(cible_id)
-            segments.append(nom_source + " -> " + nom_cible)
+            segments.append(nom_source + _detail_lien(info) + " -> " + nom_cible)
 
     # Ajout equivalences de facon simple
     # On essaye de les accrocher a un segment existant (si possible) en fin de phrase.
-    for (a, b) in equivalences:
+    for (a, b, info) in equivalences:
         nom_a = nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, a) or ("#" + str(a))
         nom_b = nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, b) or ("#" + str(b))
         deja.add(a)
         deja.add(b)
 
         # Si un des deux est deja mentionne, on affiche "X <-> Y" dans la suite
-        segments.append(nom_a + " <-> " + nom_b)
+        segments.append(nom_a + _detail_lien(info) + " <-> " + nom_b)
 
     # Si segments est vide (cas: reseau uniquement en equivalences), on affiche les equivalences
     if not segments:
         if equivalences:
-            segments = [ (nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, a) or ("#" + str(a)))
-                         + " <-> " +
-                         (nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, b) or ("#" + str(b)))
-                         for (a, b) in equivalences ]
+            segments = [
+                (nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, a) or ("#" + str(a)))
+                + _detail_lien(info)
+                + " <-> " +
+                (nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, b) or ("#" + str(b)))
+                for (a, b, info) in equivalences
+            ]
         else:
             segments = ["Reseau sans structure lisible."]
 
     # Assemblage final (style "R1: ...")
     texte = " ; ".join([s for s in segments if s.strip()])
     return texte if texte else "Reseau."
+
+
+def _detail_lien(info):
+    """Format court (poids + probabilite) pour un lien."""
+    if not info:
+        return ""
+    try:
+        poids = float(info.get("poids", 1.0))
+    except Exception:
+        poids = 1.0
+    try:
+        probabilite = float(info.get("probabilite", 1.0))
+    except Exception:
+        probabilite = 1.0
+    morceaux = []
+    if poids != 1.0:
+        morceaux.append("w=" + "{:.2f}".format(poids))
+    if probabilite != 1.0:
+        morceaux.append("p=" + "{:.2f}".format(probabilite))
+    return " (" + ", ".join(morceaux) + ")" if morceaux else ""
 
 
 # ============================================================
@@ -599,9 +702,9 @@ if not colonne_id_objet or not colonne_nom_objet:
 # ============================================================
 action = (lire_parametre_get("action", "") or "").strip()
 
-# Mode reseau: O (objets) / E (evenements)
+# Mode reseau: O (objets) / E (evenements) / P (paternes)
 type_applicable = (lire_parametre_get("type_applicable", "O") or "O").strip().upper()
-if type_applicable not in ("O", "E"):
+if type_applicable not in ("O", "E", "P"):
     type_applicable = "O"
 
 # Recherche unique (depend du mode)
@@ -622,13 +725,29 @@ if implication not in ("->", "<->"):
 # Precision (optionnelle)
 type_lien = (lire_parametre_get("type_lien", "associe") or "associe").strip()
 poids_str = (lire_parametre_get("poids", "1.0") or "1.0").strip()
+probabilite_str = (lire_parametre_get("probabilite", "1.0") or "1.0").strip()
 commentaire = (lire_parametre_get("commentaire", "") or "").strip()
+
+# Paternes (creation simple)
+paterne_nom = (lire_parametre_get("paterne_nom", "") or "").strip()
+paterne_formule = (lire_parametre_get("paterne_formule", "") or "").strip()
+paterne_description = (lire_parametre_get("paterne_description", "") or "").strip()
 
 # Convertir poids (robuste)
 try:
     poids = float(poids_str.replace(",", "."))
 except Exception:
     poids = 1.0
+
+# Convertir probabilite (robuste, entre 0 et 1)
+try:
+    probabilite = float(probabilite_str.replace(",", "."))
+except Exception:
+    probabilite = 1.0
+if probabilite < 0.0:
+    probabilite = 0.0
+if probabilite > 1.0:
+    probabilite = 1.0
 
 # Onglet / vue (priorite aux boutons)
 vue = (lire_parametre_get("vue", "liaison") or "liaison").strip().lower()
@@ -677,6 +796,28 @@ if action == "vider_cibles":
     cibles_ids = []
     message_ok = "Cibles videes."
 
+# Action: creation paterne
+if action == "creer_paterne":
+    if not paterne_nom:
+        message_erreur = "Nom du paterne manquant."
+    elif not paterne_formule:
+        message_erreur = "Formule du paterne manquante."
+    else:
+        try:
+            nouvel_id = creer_paterne(
+                connexion,
+                nom=paterne_nom,
+                type_paterne="suite",
+                formule=paterne_formule,
+                description=paterne_description
+            )
+            message_ok = "Paterne cree (id: " + str(nouvel_id) + ")."
+            paterne_nom = ""
+            paterne_formule = ""
+            paterne_description = ""
+        except Exception as e:
+            message_erreur = "Erreur creation paterne: " + str(e)
+
 # Mettre a jour la chaine apres actions
 cibles_ids_str = chaine_depuis_ids(cibles_ids)
 
@@ -705,6 +846,7 @@ if action == "creer_liaison":
                     implication=implication,
                     type_lien=(type_lien or "associe"),
                     poids=poids,
+                    probabilite=probabilite,
                     commentaire=commentaire
                 )
                 nb += 1
@@ -734,6 +876,8 @@ def nom_element_affichage(type_applicable, element_id):
         return ""
     if type_applicable == "O":
         n = nom_objet_par_id(connexion, colonne_id_objet, colonne_nom_objet, element_id)
+    elif type_applicable == "P":
+        n = nom_paterne_par_id(connexion, element_id)
     else:
         n = nom_evenement_par_id(connexion, element_id)
     n = (n or "").strip()
@@ -754,6 +898,8 @@ if texte_recherche:
     try:
         if type_applicable == "O":
             resultats_recherche = rechercher_objets(connexion, colonne_id_objet, colonne_nom_objet, texte_recherche, limite=25)
+        elif type_applicable == "P":
+            resultats_recherche = rechercher_paternes(connexion, texte_recherche, limite=25)
         else:
             resultats_recherche = rechercher_evenements(connexion, texte_recherche, limite=25)
     except Exception:
@@ -800,6 +946,7 @@ def url_etat_commun():
         "&implication=" + encoder_url(implication) +
         "&type_lien=" + encoder_url(type_lien) +
         "&poids=" + encoder_url(poids_str) +
+        "&probabilite=" + encoder_url(probabilite_str) +
         "&commentaire=" + encoder_url(commentaire) +
         "&vue=" + encoder_url(vue)
     )
@@ -1103,7 +1250,7 @@ summary {{
   <div class="ligne-univers">
     Univers : <strong>{echapper_html(nom_univers)}</strong>
     &nbsp;|&nbsp; ID : {echapper_html(uid)}
-    &nbsp;|&nbsp; Mode : <strong>{'Objets' if type_applicable=='O' else 'Evenements'}</strong>
+    &nbsp;|&nbsp; Mode : <strong>{'Objets' if type_applicable=='O' else ('Paternes' if type_applicable=='P' else 'Evenements')}</strong>
   </div>
 """)
 
@@ -1149,6 +1296,7 @@ if vue == "liaison":
     # Liens pour changer mode (Objets / Evenements)
     lien_mode_objets = "/cgi-bin/liaison.py?uid=" + uid_encode + "&type_applicable=O&vue=liaison"
     lien_mode_evenements = "/cgi-bin/liaison.py?uid=" + uid_encode + "&type_applicable=E&vue=liaison"
+    lien_mode_paternes = "/cgi-bin/liaison.py?uid=" + uid_encode + "&type_applicable=P&vue=liaison"
 
     print(f"""
     <div class="grille">
@@ -1168,6 +1316,7 @@ if vue == "liaison":
         <div class="ligne-actions">
           <a class="bouton {'bouton-secondaire' if type_applicable!='O' else ''}" href="{lien_mode_objets}">Mode Objets</a>
           <a class="bouton {'bouton-secondaire' if type_applicable!='E' else ''}" href="{lien_mode_evenements}">Mode Evenements</a>
+          <a class="bouton {'bouton-secondaire' if type_applicable!='P' else ''}" href="{lien_mode_paternes}">Mode Paternes</a>
         </div>
 
         <!-- Formulaire recherche -->
@@ -1184,6 +1333,7 @@ if vue == "liaison":
           <input type="hidden" name="implication" value="{echapper_html(implication)}">
           <input type="hidden" name="type_lien" value="{echapper_html(type_lien)}">
           <input type="hidden" name="poids" value="{echapper_html(poids_str)}">
+          <input type="hidden" name="probabilite" value="{echapper_html(probabilite_str)}">
           <input type="hidden" name="commentaire" value="{echapper_html(commentaire)}">
 
           <label class="label">Recherche</label>
@@ -1210,10 +1360,18 @@ if vue == "liaison":
                     element_id = int(ligne[0])
                     element_nom = str(ligne[1])
                     label_type = "Objet"
+                    label_detail = ""
+                elif type_applicable == "P":
+                    element_id = int(ligne[0])
+                    element_nom = str(ligne[1])
+                    formule = str(ligne[3] or "")
+                    label_type = "Paterne"
+                    label_detail = " · " + formule if formule else ""
                 else:
                     element_id = int(ligne[0])
                     element_nom = str(ligne[1])
                     label_type = "Evt"
+                    label_detail = ""
 
                 # Lien definir source
                 lien_source = "/cgi-bin/liaison.py?" + etat + "&action=definir_source&nouveau_source_id=" + str(element_id)
@@ -1224,7 +1382,7 @@ if vue == "liaison":
                   <div class="ligne-resultat">
                     <div>
                       <strong>{echapper_html(element_nom)}</strong>
-                      <span class="petit">({label_type} #{echapper_html(element_id)})</span>
+                      <span class="petit">({label_type} #{echapper_html(element_id)}{echapper_html(label_detail)})</span>
                     </div>
                     <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
                       <a class="bouton bouton-secondaire" href="{lien_source}">Source</a>
@@ -1233,6 +1391,32 @@ if vue == "liaison":
                   </div>
                 """)
         print("</div>")
+
+    # Bloc creation paterne (mode P)
+    if type_applicable == "P":
+        print(f"""
+        <details style="margin-top:16px;">
+          <summary>Creer un paterne (suite)</summary>
+          <form method="get" action="/cgi-bin/liaison.py">
+            <input type="hidden" name="uid" value="{echapper_html(uid)}">
+            <input type="hidden" name="type_applicable" value="{echapper_html(type_applicable)}">
+            <input type="hidden" name="vue" value="liaison">
+
+            <label class="label">Nom du paterne</label>
+            <input class="champ-texte" type="text" name="paterne_nom" value="{echapper_html(paterne_nom)}" placeholder="Ex: Suite simple">
+
+            <label class="label">Formule (suite)</label>
+            <input class="champ-texte" type="text" name="paterne_formule" value="{echapper_html(paterne_formule)}" placeholder="Ex: 5n + 8">
+
+            <label class="label">Description (optionnel)</label>
+            <input class="champ-texte" type="text" name="paterne_description" value="{echapper_html(paterne_description)}" placeholder="Optionnel">
+
+            <div class="ligne-actions">
+              <button class="bouton" type="submit" name="action" value="creer_paterne">Creer le paterne</button>
+            </div>
+          </form>
+        </details>
+        """)
 
     # Affichage source/cibles (claire)
     print("<h2 style='margin-top:18px;'>Etat actuel</h2>")
@@ -1313,6 +1497,9 @@ if vue == "liaison":
 
             <label class="label">Poids</label>
             <input class="champ-texte" type="text" name="poids" value="{echapper_html(poids_str)}" placeholder="1.0">
+
+            <label class="label">Probabilite (0 a 1)</label>
+            <input class="champ-texte" type="text" name="probabilite" value="{echapper_html(probabilite_str)}" placeholder="1.0">
 
             <label class="label">Commentaire</label>
             <input class="champ-texte" type="text" name="commentaire" value="{echapper_html(commentaire)}" placeholder="Optionnel">
@@ -1417,7 +1604,7 @@ else:
           </tr>
         """)
 
-        for (lid, rid, sid, cid, impl, tl, pw, comm, dc) in liaisons_recentes:
+        for (lid, rid, sid, cid, impl, tl, pw, prob, comm, dc) in liaisons_recentes:
             lib_source = nom_element_affichage(type_applicable, sid)
             lib_cible = nom_element_affichage(type_applicable, cid)
 
@@ -1425,7 +1612,9 @@ else:
             lien_suppr = "/cgi-bin/liaison.py?" + etat + "&action=supprimer_liaison&liaison_id=" + str(lid)
 
             # Petit bloc precision lisible
-            precision_txt = (tl or "associe") + " / " + str(pw)
+            precision_txt = (tl or "associe") + " / w=" + str(pw)
+            if prob is not None:
+                precision_txt += " / p=" + str(prob)
             if (comm or "").strip():
                 precision_txt += " / " + comm.strip()
 
