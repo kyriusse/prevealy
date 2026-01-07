@@ -645,7 +645,7 @@ def executer_simulation(
     Parametres:
     - ids_projection: liste d ids d objets a projeter
     - nb_annees: nombre d annees (ex: 10)
-    - annee_depart: annee de depart (ex: 2026)
+    - annee_depart: annee de depart (ex: 2025)
     - planning_evenements: liste de tuples (annee_relative, evenement_id, coef_prix, coef_ca)
 
       annee_relative:
@@ -680,7 +680,9 @@ def executer_simulation(
     if nb_annees > 80:
         nb_annees = 80
 
-    annee_depart = _int_robuste(annee_depart, 2026)
+    annee_depart = _int_robuste(annee_depart, 2025)
+    if annee_depart < 2025:
+        annee_depart = 2025
 
     # Construire etat initial
     etat = construire_etat_objets_initial(connexion, colonnes, ids_projection)

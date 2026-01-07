@@ -96,6 +96,24 @@ def chaine_depuis_ids(liste_ids):
     return ",".join([str(x) for x in (liste_ids or [])])
 
 
+def table_existe(connexion, nom_table):
+    """Verifie l existence d une table SQLite."""
+    cur = connexion.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (nom_table,))
+    return True if cur.fetchone() else False
+
+
+def normaliser_annee_depart(annee_str):
+    """Normalise l annee de depart (>= 2025)."""
+    try:
+        annee = int(str(annee_str).strip())
+    except Exception:
+        annee = 2025
+    if annee < 2025:
+        annee = 2025
+    return str(annee)
+
+
 def planning_depuis_chaine(chaine):
     """
     Transforme 'eid:annee:cp:cc,eid:annee:cp:cc' -> liste tuples.
@@ -131,6 +149,50 @@ def suggestion_mot_proche(texte, noms, max_suggestions=8):
     if not texte:
         return []
     return difflib.get_close_matches(texte, noms, n=max_suggestions, cutoff=0.60)
+
+
+def lister_paternes(conn):
+    """Liste paternes disponibles dans l univers."""
+    if not table_existe(conn, "paternes"):
+        return []
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT id, nom, description FROM paternes ORDER BY id DESC LIMIT 200")
+        return cur.fetchall()
+    except Exception:
+        return []
+
+
+def lister_evenements_details(conn):
+    """Liste les evenements avec description pour usage simulation."""
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT id, nom, description FROM evenements ORDER BY id DESC")
+        return cur.fetchall()
+    except Exception:
+        return []
+
+
+def lire_parametres_evenements(conn, ids_evenements):
+    """Charge les parametres_evenements pour un set d ids."""
+    if not ids_evenements or not table_existe(conn, "parametres_evenements"):
+        return {}
+    cur = conn.cursor()
+    placeholders = ",".join(["?"] * len(ids_evenements))
+    try:
+        cur.execute(
+            "SELECT evenement_id, cle, valeur FROM parametres_evenements WHERE evenement_id IN ({})".format(placeholders),
+            ids_evenements
+        )
+    except Exception:
+        return {}
+    params = {}
+    for evt_id, cle, valeur in cur.fetchall():
+        if evt_id not in params:
+            params[evt_id] = {}
+        if cle:
+            params[evt_id][str(cle)] = valeur
+    return params
 
 
 # ============================================================
@@ -179,7 +241,9 @@ type_choisi = lire_parametre_get("type", "").strip()
 
 # Nombre d annees + annee depart
 nb_annees_str = lire_parametre_get("nb_annees", "10").strip()
-annee_depart_str = lire_parametre_get("annee_depart", "2026").strip()
+annee_depart_str = lire_parametre_get("annee_depart", "2025").strip()
+annee_depart_str = normaliser_annee_depart(annee_depart_str)
+annee_depart_int = int(annee_depart_str)
 
 # Planning evenements (stocke dans l URL)
 planning_texte = lire_parametre_get("planning", "").strip()
@@ -336,6 +400,32 @@ def lister_evenements(conn):
 
 liste_evenements = lister_evenements(connexion)
 
+paternes = lister_paternes(connexion)
+paternes_map = {int(pid): {"nom": nom, "description": desc} for (pid, nom, desc) in paternes}
+
+evenements_details = lister_evenements_details(connexion)
+evenements_ids = [int(eid) for (eid, _, _) in evenements_details if str(eid).isdigit()]
+parametres_par_evenement = lire_parametres_evenements(connexion, evenements_ids)
+evenements_map = {}
+for eid, nom, desc in evenements_details:
+    eid_int = int(eid)
+    params_evt = parametres_par_evenement.get(eid_int, {})
+    desc_finale = desc or params_evt.get("description") or ""
+    paterne_id = params_evt.get("paterne_id")
+    paterne_nom = ""
+    paterne_desc = ""
+    if paterne_id and str(paterne_id).isdigit():
+        paterne = paternes_map.get(int(paterne_id))
+        if paterne:
+            paterne_nom = paterne.get("nom", "")
+            paterne_desc = paterne.get("description", "")
+    evenements_map[eid_int] = {
+        "nom": nom,
+        "description": desc_finale,
+        "paterne_nom": paterne_nom,
+        "paterne_description": paterne_desc,
+    }
+
 
 # ============================================================
 # Construire liste finale d objets a projeter
@@ -385,6 +475,7 @@ ids_projection = construire_ids_projection(connexion, colonnes, selection_ids, f
 
 resultat_simulation = None
 svg = ""
+planning_details = []
 
 if action == "simuler":
     if not ids_projection:
@@ -417,7 +508,51 @@ if action == "simuler":
             if pts_ca_total and max([p[1] for p in pts_ca_total]) > 0:
                 series["CA total"] = pts_ca_total
 
-            svg = generer_svg_courbes(series, titre="Simulation - {}".format(nom_univers))
+            prix_par_annee = {int(a): v for (a, v) in pts_prix_total if a is not None}
+            evenements_points = []
+
+            for (ar, eid, cp, cc) in (planning or []):
+                try:
+                    ar_int = int(ar)
+                except Exception:
+                    ar_int = 0
+                annee_evt = annee_depart_int + ar_int
+                valeur_evt = prix_par_annee.get(annee_evt)
+                infos_evt = evenements_map.get(int(eid), {})
+                nom_evt = infos_evt.get("nom") or "Evenement"
+                desc_evt = infos_evt.get("description") or ""
+                paterne_evt = infos_evt.get("paterne_nom") or ""
+                paterne_desc_evt = infos_evt.get("paterne_description") or ""
+                planning_details.append({
+                    "annee": annee_evt,
+                    "nom": nom_evt,
+                    "description": desc_evt,
+                    "paterne": paterne_evt,
+                    "paterne_description": paterne_desc_evt,
+                    "coef_prix": cp,
+                    "coef_ca": cc
+                })
+                if valeur_evt is None:
+                    continue
+                details_evt = "Annee {} | Coef prix {} | Coef CA {}".format(annee_evt, cp, cc)
+                if paterne_evt:
+                    details_evt += " | Paterne: {}".format(paterne_evt)
+                if desc_evt:
+                    details_evt += " | {}".format(desc_evt)
+                evenements_points.append({
+                    "x": annee_evt,
+                    "y": valeur_evt,
+                    "titre": nom_evt,
+                    "details": details_evt
+                })
+
+            svg = generer_svg_courbes(
+                series,
+                titre="Simulation - {}".format(nom_univers),
+                evenements=evenements_points,
+                label_x="Annees",
+                label_y="Valeur"
+            )
 
 
 # ============================================================
@@ -841,7 +976,7 @@ print("""
     <input type="hidden" name="type" value="{typ}">
     <input type="hidden" name="planning" value="{planning}">
 
-    <label class="label">Annee depart</label>
+    <label class="label">Annee depart (>= 2025)</label>
     <input class="champ-texte" type="text" name="annee_depart" value="{ad}">
 
     <label class="label">Nombre d annees</label>
@@ -899,7 +1034,7 @@ if not planning:
     print('<div class="message">Aucun evenement planifie.</div>')
 else:
     print('<table class="table">')
-    print('<tr><th>#</th><th>Evenement</th><th>Annee</th><th>Coef prix</th><th>Coef CA</th><th></th></tr>')
+    print('<tr><th>#</th><th>Evenement</th><th>Paterne</th><th>Annee</th><th>Coef prix</th><th>Coef CA</th><th></th></tr>')
     # Build map id->nom
     map_evt = {}
     for eid, nom_evt in liste_evenements:
@@ -907,6 +1042,7 @@ else:
 
     for i, (ar, eid, cp, cc) in enumerate(planning):
         nom_evt = map_evt.get(int(eid), "Evenement")
+        paterne_evt = evenements_map.get(int(eid), {}).get("paterne_nom") or "-"
         lien_suppr = (
             "/cgi-bin/sim.py?uid={uid}"
             "&action=supprimer_planning"
@@ -933,6 +1069,7 @@ else:
         <tr>
           <td>{i}</td>
           <td>{nom} <span class="petit">(# {eid})</span></td>
+          <td>{paterne}</td>
           <td>{ar}</td>
           <td>{cp}</td>
           <td>{cc}</td>
@@ -941,6 +1078,7 @@ else:
         """.format(
             i=echapper_html(i),
             nom=echapper_html(nom_evt),
+            paterne=echapper_html(paterne_evt),
             eid=echapper_html(eid),
             ar=echapper_html(ar),
             cp=echapper_html(cp),
@@ -1000,6 +1138,27 @@ if resultat_simulation:
     print('<div class="message">Courbe globale (prix moyen total, et CA total si disponible).</div>')
     if svg:
         print('<div style="margin-top:10px; border-radius:18px; overflow:hidden; border:1px solid rgba(255,255,255,0.10);">{}</div>'.format(svg))
+
+    if planning_details:
+        print('<div class="message" style="margin-top:14px;">Evenements et paternes du planning</div>')
+        print('<table class="table">')
+        print('<tr><th>Annee</th><th>Evenement</th><th>Paterne</th><th>Coef prix</th><th>Coef CA</th><th>Infos</th></tr>')
+        for evt in planning_details:
+            info_parts = []
+            if evt.get("description"):
+                info_parts.append(evt["description"])
+            if evt.get("paterne_description"):
+                info_parts.append("Paterne: {}".format(evt["paterne_description"]))
+            info_txt = " | ".join(info_parts)
+            print('<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
+                echapper_html(evt.get("annee")),
+                echapper_html(evt.get("nom")),
+                echapper_html(evt.get("paterne") or "-"),
+                echapper_html(evt.get("coef_prix")),
+                echapper_html(evt.get("coef_ca")),
+                echapper_html(info_txt)
+            ))
+        print('</table>')
 
     # Tableau global
     annees = resultat_simulation.get("annees", [])
