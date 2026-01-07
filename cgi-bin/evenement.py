@@ -339,6 +339,48 @@ def lister_evenements(connexion, limite=200):
     return cur.fetchall()
 
 
+def lister_paternes(connexion, limite=200):
+    """Liste paternes disponibles."""
+    if not table_existe(connexion, "paternes"):
+        return []
+    cur = connexion.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT id, nom, description
+            FROM paternes
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limite,)
+        )
+        return cur.fetchall()
+    except Exception:
+        return []
+
+
+def lire_parametres_evenements_map(connexion, ids_evenements):
+    """Charge parametres_evenements pour plusieurs evenements."""
+    if not ids_evenements or not table_existe(connexion, "parametres_evenements"):
+        return {}
+    cur = connexion.cursor()
+    placeholders = ",".join(["?"] * len(ids_evenements))
+    try:
+        cur.execute(
+            "SELECT evenement_id, cle, valeur FROM parametres_evenements WHERE evenement_id IN ({})".format(placeholders),
+            ids_evenements
+        )
+    except Exception:
+        return {}
+    params = {}
+    for evt_id, cle, valeur in cur.fetchall():
+        if evt_id not in params:
+            params[evt_id] = {}
+        if cle:
+            params[evt_id][str(cle)] = valeur
+    return params
+
+
 def supprimer_evenement(connexion, evenement_id):
     """Supprime un evenement + parametres."""
     cur = connexion.cursor()
@@ -397,6 +439,7 @@ if table_stat_objects_ok:
 # Familles / Types disponibles (si colonnes existent)
 liste_familles = distinct_texte(connexion, "Famille") if table_stat_objects_ok else []
 liste_types = distinct_texte(connexion, "Type") if table_stat_objects_ok else []
+liste_paternes = lister_paternes(connexion)
 
 
 # ============================================================
@@ -412,6 +455,8 @@ if mode not in ("Ec", "Ep", "Ea"):
 # Champs communs
 nom_evenement = (lire_parametre_get("nom_evenement", "") or "").strip()
 description = (lire_parametre_get("description", "") or "").strip()
+paterne_id_str = (lire_parametre_get("paterne_id", "") or "").strip()
+paterne_id = int(paterne_id_str) if paterne_id_str.isdigit() else None
 
 # Afficher simulation
 afficher_simulation_str = (lire_parametre_get("afficher_simulation", "1") or "1").strip()
@@ -576,6 +621,8 @@ if action == "creer":
         parametres.append(("probabilite", str(probabilite_evt)))
         if description:
             parametres.append(("description", description))
+        if paterne_id is not None:
+            parametres.append(("paterne_id", str(paterne_id)))
 
         # -------------------------
         # Ec: Constat
@@ -704,6 +751,10 @@ try:
 except Exception:
     liste_evenements = []
 
+ids_evenements = [int(e[0]) for e in liste_evenements if str(e[0]).isdigit()]
+parametres_evenements_map = lire_parametres_evenements_map(connexion, ids_evenements)
+paternes_map = {int(pid): {"nom": nom, "description": desc} for (pid, nom, desc) in liste_paternes}
+
 # Resultats recherche objets (utiles si portee=liste ou constat objet)
 resultats_objets = []
 if recherche_objet and table_stat_objects_ok and colonne_id_objet and colonne_nom_objet:
@@ -725,6 +776,14 @@ lien_menu_simulation = "/cgi-bin/menu_simulation.py?uid=" + uid_encode
 # HTML / CSS (mystique, clair)
 # NOTE: f-string => CSS doit doubler {{ }}
 # ============================================================
+options_paternes = '<option value="">(aucun)</option>'
+for pid, nom, desc in liste_paternes:
+    sel = "selected" if paterne_id == pid else ""
+    label = "{}".format(nom)
+    if desc:
+        label += " - {}".format(desc)
+    options_paternes += f'<option value="{pid}" {sel}>{echapper_html(label)}</option>'
+
 print(f"""
 <!DOCTYPE html>
 <html lang="fr">
@@ -1013,6 +1072,11 @@ print(f"""
 
         <label class="label">Description (optionnel)</label>
         <textarea name="description" placeholder="Explique...">{echapper_html(description)}</textarea>
+
+        <label class="label">Paterne associe (optionnel)</label>
+        <select class="champ-select" name="paterne_id">
+          {options_paternes}
+        </select>
 
         <div class="ligne-actions" style="justify-content:flex-start;">
           <a class="bouton bouton-mode {'actif' if mode=='Ec' else ''}"
@@ -1410,6 +1474,18 @@ else:
         badge = "E" if str(type_ev) == "E" else str(type_ev)
         det = str(type_det or "")
         petit_type = badge if badge != "E" else ("E (detail: " + (det if det else "?") + ")")
+        params_evt = parametres_evenements_map.get(int(eid), {})
+        paterne_nom = ""
+        paterne_desc = ""
+        paterne_id_evt = params_evt.get("paterne_id")
+        if paterne_id_evt and str(paterne_id_evt).isdigit():
+            paterne = paternes_map.get(int(paterne_id_evt))
+            if paterne:
+                paterne_nom = paterne.get("nom", "")
+                paterne_desc = paterne.get("description", "")
+        paterne_label = paterne_nom if paterne_nom else "Aucun paterne"
+        if paterne_desc:
+            paterne_label += " - " + paterne_desc
 
         lien_suppr = (
             "/cgi-bin/evenement.py?uid=" + uid_encode +
@@ -1426,6 +1502,7 @@ else:
             <div>
               <strong>{echapper_html(nom)}</strong>
               <span class="petit">(# {echapper_html(eid)} / {echapper_html(petit_type)})</span><br>
+              <span class="petit">Paterne: {echapper_html(paterne_label)}</span><br>
               <span class="petit">{echapper_html(dc)}</span>
             </div>
             <a class="lien-supprimer" href="{lien_suppr}">Supprimer</a>

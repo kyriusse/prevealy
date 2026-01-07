@@ -24,6 +24,8 @@ import sqlite3
 import urllib.parse
 import html
 import difflib
+import re
+import ast
 
 from sim_calc import executer_simulation, detecter_colonnes_statistiques
 from stats_utils import generer_svg_courbes
@@ -96,10 +98,30 @@ def chaine_depuis_ids(liste_ids):
     return ",".join([str(x) for x in (liste_ids or [])])
 
 
+def table_existe(connexion, nom_table):
+    """Verifie l existence d une table SQLite."""
+    cur = connexion.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (nom_table,))
+    return True if cur.fetchone() else False
+
+
+def normaliser_annee_depart(annee_str):
+    """Normalise l annee de depart (>= 2025)."""
+    try:
+        annee = int(str(annee_str).strip())
+    except Exception:
+        annee = 2025
+    if annee < 2025:
+        annee = 2025
+    return str(annee)
+
+
 def planning_depuis_chaine(chaine):
     """
-    Transforme 'eid:annee:cp:cc,eid:annee:cp:cc' -> liste tuples.
-    Exemple: '12:0:0.9:1.0,15:3:1.1:1.0'
+    Transforme la chaine planning -> liste tuples.
+    Formats:
+    - 'eid:annee:cp:cc'
+    - 'eid:annee:cp:cc:mode:paterne_id:n'
     """
     resultat = []
     for bloc in (chaine or "").split(","):
@@ -113,16 +135,26 @@ def planning_depuis_chaine(chaine):
         ar = parts[1].strip()
         cp = parts[2].strip() if len(parts) >= 3 else "1.0"
         cc = parts[3].strip() if len(parts) >= 4 else "1.0"
+        mode_proj = parts[4].strip() if len(parts) >= 5 else "annee"
+        paterne_id = parts[5].strip() if len(parts) >= 6 else ""
+        paterne_n = parts[6].strip() if len(parts) >= 7 else ""
         if eid.isdigit():
-            resultat.append((ar, int(eid), cp, cc))
+            resultat.append((ar, int(eid), cp, cc, mode_proj, paterne_id, paterne_n))
     return resultat
 
 
 def planning_vers_chaine(planning):
     """Inverse de planning_depuis_chaine."""
     blocs = []
-    for (ar, eid, cp, cc) in (planning or []):
-        blocs.append("{}:{}:{}:{}".format(ar, eid, cp, cc))
+    for item in (planning or []):
+        ar, eid, cp, cc = item[0], item[1], item[2], item[3]
+        mode_proj = item[4] if len(item) >= 5 else "annee"
+        paterne_id = item[5] if len(item) >= 6 else ""
+        paterne_n = item[6] if len(item) >= 7 else ""
+        if mode_proj and mode_proj != "annee":
+            blocs.append("{}:{}:{}:{}:{}:{}:{}".format(ar, eid, cp, cc, mode_proj, paterne_id, paterne_n))
+        else:
+            blocs.append("{}:{}:{}:{}".format(ar, eid, cp, cc))
     return ",".join(blocs)
 
 
@@ -131,6 +163,111 @@ def suggestion_mot_proche(texte, noms, max_suggestions=8):
     if not texte:
         return []
     return difflib.get_close_matches(texte, noms, n=max_suggestions, cutoff=0.60)
+
+
+def lister_paternes(conn):
+    """Liste paternes disponibles dans l univers."""
+    if not table_existe(conn, "paternes"):
+        return []
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT id, nom, formule, description FROM paternes ORDER BY id DESC LIMIT 200")
+        return cur.fetchall()
+    except Exception:
+        return []
+
+
+def lister_evenements_details(conn):
+    """Liste les evenements avec description pour usage simulation."""
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT id, nom, description FROM evenements ORDER BY id DESC")
+        return cur.fetchall()
+    except Exception:
+        return []
+
+
+def lire_parametres_evenements(conn, ids_evenements):
+    """Charge les parametres_evenements pour un set d ids."""
+    if not ids_evenements or not table_existe(conn, "parametres_evenements"):
+        return {}
+    cur = conn.cursor()
+    placeholders = ",".join(["?"] * len(ids_evenements))
+    try:
+        cur.execute(
+            "SELECT evenement_id, cle, valeur FROM parametres_evenements WHERE evenement_id IN ({})".format(placeholders),
+            ids_evenements
+        )
+    except Exception:
+        return {}
+    params = {}
+    for evt_id, cle, valeur in cur.fetchall():
+        if evt_id not in params:
+            params[evt_id] = {}
+        if cle:
+            params[evt_id][str(cle)] = valeur
+    return params
+
+
+def _normaliser_formule(formule):
+    """Normalise une formule simple (ex: 5n + 8)."""
+    s = str(formule or "").strip()
+    s = s.replace(",", ".")
+    s = re.sub(r"(\\d)\\s*n", r"\\1*n", s)
+    s = re.sub(r"n\\s*(\\d)", r"n*\\1", s)
+    s = re.sub(r"\\)\\s*n", r")*n", s)
+    s = re.sub(r"n\\s*\\(", r"n*(", s)
+    return s
+
+
+def evaluer_formule_paterne(formule, n):
+    """Evalue une formule simple avec n (suite)."""
+    s = _normaliser_formule(formule)
+    if not s:
+        return None
+    try:
+        arbre = ast.parse(s, mode="eval")
+    except Exception:
+        return None
+
+    def _eval(node):
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.BinOp):
+            gauche = _eval(node.left)
+            droite = _eval(node.right)
+            if isinstance(node.op, ast.Add):
+                return gauche + droite
+            if isinstance(node.op, ast.Sub):
+                return gauche - droite
+            if isinstance(node.op, ast.Mult):
+                return gauche * droite
+            if isinstance(node.op, ast.Div):
+                return gauche / droite
+            if isinstance(node.op, ast.Pow):
+                return gauche ** droite
+            return None
+        if isinstance(node, ast.UnaryOp):
+            val = _eval(node.operand)
+            if isinstance(node.op, ast.UAdd):
+                return +val
+            if isinstance(node.op, ast.USub):
+                return -val
+            return None
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return float(node.value)
+            return None
+        if isinstance(node, ast.Name):
+            if node.id == "n":
+                return float(n)
+            return None
+        return None
+
+    try:
+        return _eval(arbre)
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -179,7 +316,9 @@ type_choisi = lire_parametre_get("type", "").strip()
 
 # Nombre d annees + annee depart
 nb_annees_str = lire_parametre_get("nb_annees", "10").strip()
-annee_depart_str = lire_parametre_get("annee_depart", "2026").strip()
+annee_depart_str = lire_parametre_get("annee_depart", "2025").strip()
+annee_depart_str = normaliser_annee_depart(annee_depart_str)
+annee_depart_int = int(annee_depart_str)
 
 # Planning evenements (stocke dans l URL)
 planning_texte = lire_parametre_get("planning", "").strip()
@@ -190,6 +329,9 @@ evenement_ajout_id_str = lire_parametre_get("evenement_ajout_id", "").strip()
 evenement_ajout_annee_str = lire_parametre_get("evenement_ajout_annee", "0").strip()
 evenement_ajout_coef_prix_str = lire_parametre_get("evenement_ajout_coef_prix", "1.0").strip()
 evenement_ajout_coef_ca_str = lire_parametre_get("evenement_ajout_coef_ca", "1.0").strip()
+evenement_ajout_mode = lire_parametre_get("evenement_ajout_mode", "annee").strip()
+evenement_ajout_paterne_id = lire_parametre_get("evenement_ajout_paterne_id", "").strip()
+evenement_ajout_paterne_n = lire_parametre_get("evenement_ajout_paterne_n", "0").strip()
 
 
 # ============================================================
@@ -236,12 +378,33 @@ if action == "ajouter_planning":
     else:
         eid = int(evenement_ajout_id_str)
         # Stockage annee_relative (int), coef_prix, coef_ca
+        cp = evenement_ajout_coef_prix_str.strip() or "1.0"
+        cc = evenement_ajout_coef_ca_str.strip() or "1.0"
+        mode_proj = evenement_ajout_mode if evenement_ajout_mode in ("annee", "paterne") else "annee"
+        paterne_id = evenement_ajout_paterne_id.strip()
+        paterne_n = evenement_ajout_paterne_n.strip() or "0"
         ar = evenement_ajout_annee_str.strip()
-        cp = evenement_ajout_coef_prix_str.strip()
-        cc = evenement_ajout_coef_ca_str.strip()
-        planning.append((ar, eid, cp, cc))
+
+        if mode_proj == "paterne":
+            if not paterne_id.isdigit() or int(paterne_id) not in paternes_map:
+                message_erreur = "Choisis un paterne valide."
+            else:
+                formule = paternes_map[int(paterne_id)].get("formule")
+                try:
+                    n_val = int(paterne_n)
+                except Exception:
+                    n_val = 0
+                resultat = evaluer_formule_paterne(formule, n_val)
+                if resultat is None:
+                    message_erreur = "Formule de paterne invalide."
+                else:
+                    ar = str(int(round(resultat)))
+
+        if not message_erreur:
+            planning.append((ar, eid, cp, cc, mode_proj, paterne_id, paterne_n))
         planning_texte = planning_vers_chaine(planning)
-        message_ok = "Evenement ajoute au planning."
+        if not message_erreur:
+            message_ok = "Evenement ajoute au planning."
 
 if action == "vider_planning":
     planning = []
@@ -336,6 +499,32 @@ def lister_evenements(conn):
 
 liste_evenements = lister_evenements(connexion)
 
+paternes = lister_paternes(connexion)
+paternes_map = {int(pid): {"nom": nom, "formule": formule, "description": desc} for (pid, nom, formule, desc) in paternes}
+
+evenements_details = lister_evenements_details(connexion)
+evenements_ids = [int(eid) for (eid, _, _) in evenements_details if str(eid).isdigit()]
+parametres_par_evenement = lire_parametres_evenements(connexion, evenements_ids)
+evenements_map = {}
+for eid, nom, desc in evenements_details:
+    eid_int = int(eid)
+    params_evt = parametres_par_evenement.get(eid_int, {})
+    desc_finale = desc or params_evt.get("description") or ""
+    paterne_id = params_evt.get("paterne_id")
+    paterne_nom = ""
+    paterne_desc = ""
+    if paterne_id and str(paterne_id).isdigit():
+        paterne = paternes_map.get(int(paterne_id))
+        if paterne:
+            paterne_nom = paterne.get("nom", "")
+            paterne_desc = paterne.get("description", "")
+    evenements_map[eid_int] = {
+        "nom": nom,
+        "description": desc_finale,
+        "paterne_nom": paterne_nom,
+        "paterne_description": paterne_desc,
+    }
+
 
 # ============================================================
 # Construire liste finale d objets a projeter
@@ -385,17 +574,40 @@ ids_projection = construire_ids_projection(connexion, colonnes, selection_ids, f
 
 resultat_simulation = None
 svg = ""
+planning_details = []
+planning_for_calc = []
 
 if action == "simuler":
     if not ids_projection:
         message_erreur = "Choisis au moins un objet (selection), ou une famille, ou un type."
     else:
+        planning_for_calc = []
+        for item in (planning or []):
+            ar, eid, cp, cc = item[0], item[1], item[2], item[3]
+            mode_proj = item[4] if len(item) >= 5 else "annee"
+            paterne_id = item[5] if len(item) >= 6 else ""
+            paterne_n = item[6] if len(item) >= 7 else ""
+
+            if mode_proj == "paterne":
+                if paterne_id and paterne_id.isdigit() and int(paterne_id) in paternes_map:
+                    formule = paternes_map[int(paterne_id)].get("formule")
+                    try:
+                        n_val = int(paterne_n)
+                    except Exception:
+                        n_val = 0
+                    resultat = evaluer_formule_paterne(formule, n_val)
+                    if resultat is None:
+                        message_erreur = "Formule de paterne invalide."
+                        continue
+                    ar = str(int(round(resultat)))
+            planning_for_calc.append((ar, eid, cp, cc, mode_proj, paterne_id, paterne_n))
+
         resultat_simulation = executer_simulation(
             connexion=connexion,
             ids_projection=ids_projection,
             nb_annees=nb_annees_str,
             annee_depart=annee_depart_str,
-            planning_evenements=planning
+            planning_evenements=[(p[0], p[1], p[2], p[3]) for p in planning_for_calc]
         )
 
         if resultat_simulation:
@@ -417,7 +629,58 @@ if action == "simuler":
             if pts_ca_total and max([p[1] for p in pts_ca_total]) > 0:
                 series["CA total"] = pts_ca_total
 
-            svg = generer_svg_courbes(series, titre="Simulation - {}".format(nom_univers))
+            prix_par_annee = {int(a): v for (a, v) in pts_prix_total if a is not None}
+            evenements_points = []
+
+            for item in (planning_for_calc or []):
+                ar, eid, cp, cc = item[0], item[1], item[2], item[3]
+                mode_proj = item[4] if len(item) >= 5 else "annee"
+                paterne_id = item[5] if len(item) >= 6 else ""
+                paterne_n = item[6] if len(item) >= 7 else ""
+                try:
+                    ar_int = int(ar)
+                except Exception:
+                    ar_int = 0
+                annee_evt = annee_depart_int + ar_int
+                valeur_evt = prix_par_annee.get(annee_evt)
+                infos_evt = evenements_map.get(int(eid), {})
+                nom_evt = infos_evt.get("nom") or "Evenement"
+                desc_evt = infos_evt.get("description") or ""
+                paterne_evt = infos_evt.get("paterne_nom") or ""
+                paterne_desc_evt = infos_evt.get("paterne_description") or ""
+                planning_details.append({
+                    "annee": annee_evt,
+                    "nom": nom_evt,
+                    "description": desc_evt,
+                    "paterne": paterne_evt,
+                    "paterne_description": paterne_desc_evt,
+                    "coef_prix": cp,
+                    "coef_ca": cc,
+                    "mode": mode_proj,
+                    "paterne_id": paterne_id,
+                    "paterne_n": paterne_n
+                })
+                if valeur_evt is None:
+                    continue
+                details_evt = "Annee {} | Coef prix {} | Coef CA {}".format(annee_evt, cp, cc)
+                if paterne_evt:
+                    details_evt += " | Paterne: {}".format(paterne_evt)
+                if desc_evt:
+                    details_evt += " | {}".format(desc_evt)
+                evenements_points.append({
+                    "x": annee_evt,
+                    "y": valeur_evt,
+                    "titre": nom_evt,
+                    "details": details_evt
+                })
+
+            svg = generer_svg_courbes(
+                series,
+                titre="Simulation - {}".format(nom_univers),
+                evenements=evenements_points,
+                label_x="Annees",
+                label_y="Valeur"
+            )
 
 
 # ============================================================
@@ -660,18 +923,22 @@ print("""
         <input type="hidden" name="uid" value="{uid}">
         <input type="hidden" name="selection_ids" value="{sel}">
         <input type="hidden" name="planning" value="{planning}">
+        <input type="hidden" name="nb_annees" value="{na}">
+        <input type="hidden" name="annee_depart" value="{ad}">
         <label class="label">Recherche objet</label>
         <input class="champ-texte" type="text" name="recherche_objet" value="{rech}" placeholder="Ex: stylo, mur...">
         <div class="ligne-actions">
           <button class="bouton" type="submit">Chercher</button>
           <a class="bouton bouton-secondaire" href="/cgi-bin/sim.py?uid={uid}">Reset</a>
-        </div>
-      </form>
+      </div>
+    </form>
 """.format(
     uid=uid_encode,
     sel=echapper_html(selection_ids_texte),
     planning=echapper_html(planning_texte),
-    rech=echapper_html(recherche_objet)
+    rech=echapper_html(recherche_objet),
+    na=echapper_html(nb_annees_str),
+    ad=echapper_html(annee_depart_str)
 ))
 
 # Resultats recherche
@@ -722,11 +989,15 @@ if recherche_objet:
                     "&recherche_objet={rech}"
                     "&selection_ids={sel}"
                     "&planning={planning}"
+                    "&nb_annees={na}"
+                    "&annee_depart={ad}"
                 ).format(
                     uid=uid_encode,
                     rech=urllib.parse.quote(s),
                     sel=urllib.parse.quote(selection_ids_texte),
-                    planning=urllib.parse.quote(planning_texte)
+                    planning=urllib.parse.quote(planning_texte),
+                    na=urllib.parse.quote(nb_annees_str),
+                    ad=urllib.parse.quote(annee_depart_str)
                 )
                 print('<div class="ligne-resultat"><div>{}</div><a class="bouton bouton-secondaire" href="{}">Utiliser</a></div>'.format(
                     echapper_html(s), lien_s
@@ -793,10 +1064,18 @@ print("""
     <input type="hidden" name="uid" value="{uid}">
     <input type="hidden" name="selection_ids" value="{sel}">
     <input type="hidden" name="planning" value="{planning}">
+    <input type="hidden" name="nb_annees" value="{na}">
+    <input type="hidden" name="annee_depart" value="{ad}">
     <label class="label">Famille (si selection vide)</label>
     <select class="champ-select" name="famille">
       <option value="">(aucune)</option>
-""".format(uid=uid_encode, sel=echapper_html(selection_ids_texte), planning=echapper_html(planning_texte)))
+""".format(
+    uid=uid_encode,
+    sel=echapper_html(selection_ids_texte),
+    planning=echapper_html(planning_texte),
+    na=echapper_html(nb_annees_str),
+    ad=echapper_html(annee_depart_str)
+))
 
 for f in familles:
     sel = 'selected' if famille_choisie == str(f) else ''
@@ -841,7 +1120,7 @@ print("""
     <input type="hidden" name="type" value="{typ}">
     <input type="hidden" name="planning" value="{planning}">
 
-    <label class="label">Annee depart</label>
+    <label class="label">Annee depart (>= 2025)</label>
     <input class="champ-texte" type="text" name="annee_depart" value="{ad}">
 
     <label class="label">Nombre d annees</label>
@@ -880,6 +1159,42 @@ print("""
       <label class="label">Arrivee (annee relative)</label>
       <input class="champ-texte" type="text" name="evenement_ajout_annee" value="0">
 
+      <label class="label">Mode de projection</label>
+      <select class="champ-select" name="evenement_ajout_mode">
+        <option value="annee" {sel_annee}>Annee relative</option>
+        <option value="paterne" {sel_paterne}>Paterne (suite)</option>
+      </select>
+
+      <details style="margin-top:8px;" {open_paterne}>
+        <summary>Projection par paterne</summary>
+        <label class="label">Paterne</label>
+        <select class="champ-select" name="evenement_ajout_paterne_id">
+          <option value="">(choisir)</option>
+""".format(
+    sel_annee="selected" if evenement_ajout_mode == "annee" else "",
+    sel_paterne="selected" if evenement_ajout_mode == "paterne" else "",
+    open_paterne="open" if evenement_ajout_mode == "paterne" else ""
+))
+
+for pid, nom, formule, desc in paternes:
+    label = "{}".format(nom)
+    if formule:
+        label += " · " + str(formule)
+    if desc:
+        label += " - " + str(desc)
+    sel = "selected" if evenement_ajout_paterne_id == str(pid) else ""
+    print('<option value="{id}" {sel}>{label}</option>'.format(
+        id=echapper_html(pid),
+        sel=sel,
+        label=echapper_html(label)
+    ))
+
+print("""
+        </select>
+        <label class="label">Indice n</label>
+        <input class="champ-texte" type="text" name="evenement_ajout_paterne_n" value="{paterne_n}">
+      </details>
+
       <label class="label">Coef prix (ex: 0.90 / 1.10)</label>
       <input class="champ-texte" type="text" name="evenement_ajout_coef_prix" value="1.0">
 
@@ -891,7 +1206,9 @@ print("""
       </div>
     </details>
   </form>
-""")
+""".format(
+    paterne_n=echapper_html(evenement_ajout_paterne_n)
+))
 
 # Afficher planning
 print("<h2 style='margin-top:18px;'>Planning</h2>")
@@ -899,14 +1216,24 @@ if not planning:
     print('<div class="message">Aucun evenement planifie.</div>')
 else:
     print('<table class="table">')
-    print('<tr><th>#</th><th>Evenement</th><th>Annee</th><th>Coef prix</th><th>Coef CA</th><th></th></tr>')
+    print('<tr><th>#</th><th>Evenement</th><th>Paterne</th><th>Annee</th><th>Coef prix</th><th>Coef CA</th><th></th></tr>')
     # Build map id->nom
     map_evt = {}
     for eid, nom_evt in liste_evenements:
         map_evt[int(eid)] = str(nom_evt)
 
-    for i, (ar, eid, cp, cc) in enumerate(planning):
+    for i, item in enumerate(planning):
+        ar, eid, cp, cc = item[0], item[1], item[2], item[3]
+        mode_proj = item[4] if len(item) >= 5 else "annee"
+        paterne_id = item[5] if len(item) >= 6 else ""
+        paterne_n = item[6] if len(item) >= 7 else ""
         nom_evt = map_evt.get(int(eid), "Evenement")
+        paterne_evt = evenements_map.get(int(eid), {}).get("paterne_nom") or "-"
+        if mode_proj == "paterne" and paterne_id and paterne_id.isdigit():
+            paterne_info = paternes_map.get(int(paterne_id), {})
+            paterne_evt = paterne_info.get("nom") or paterne_evt
+            if paterne_n:
+                paterne_evt = "{} (n={})".format(paterne_evt, paterne_n)
         lien_suppr = (
             "/cgi-bin/sim.py?uid={uid}"
             "&action=supprimer_planning"
@@ -933,6 +1260,7 @@ else:
         <tr>
           <td>{i}</td>
           <td>{nom} <span class="petit">(# {eid})</span></td>
+          <td>{paterne}</td>
           <td>{ar}</td>
           <td>{cp}</td>
           <td>{cc}</td>
@@ -941,6 +1269,7 @@ else:
         """.format(
             i=echapper_html(i),
             nom=echapper_html(nom_evt),
+            paterne=echapper_html(paterne_evt),
             eid=echapper_html(eid),
             ar=echapper_html(ar),
             cp=echapper_html(cp),
@@ -1000,6 +1329,31 @@ if resultat_simulation:
     print('<div class="message">Courbe globale (prix moyen total, et CA total si disponible).</div>')
     if svg:
         print('<div style="margin-top:10px; border-radius:18px; overflow:hidden; border:1px solid rgba(255,255,255,0.10);">{}</div>'.format(svg))
+        print('<div class="message" style="margin-top:12px;">Survole un point pour voir les informations (les points jaunes = evenements).</div>')
+
+    if planning_details:
+        print('<div class="message" style="margin-top:14px;">Evenements et paternes du planning</div>')
+        print('<table class="table">')
+        print('<tr><th>Annee</th><th>Evenement</th><th>Paterne</th><th>Coef prix</th><th>Coef CA</th><th>Infos</th></tr>')
+        for evt in planning_details:
+            info_parts = []
+            if evt.get("description"):
+                info_parts.append(evt["description"])
+            if evt.get("paterne_description"):
+                info_parts.append("Paterne: {}".format(evt["paterne_description"]))
+            if evt.get("mode") == "paterne":
+                n_val = evt.get("paterne_n") or "0"
+                info_parts.append("Projection: paterne (n={})".format(n_val))
+            info_txt = " | ".join(info_parts)
+            print('<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
+                echapper_html(evt.get("annee")),
+                echapper_html(evt.get("nom")),
+                echapper_html(evt.get("paterne") or "-"),
+                echapper_html(evt.get("coef_prix")),
+                echapper_html(evt.get("coef_ca")),
+                echapper_html(info_txt)
+            ))
+        print('</table>')
 
     # Tableau global
     annees = resultat_simulation.get("annees", [])

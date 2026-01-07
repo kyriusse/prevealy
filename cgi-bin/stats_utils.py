@@ -113,7 +113,10 @@ def generer_svg_courbes(
     titre="Simulation",
     largeur=980,
     hauteur=320,
-    marge=42
+    marge=42,
+    evenements=None,
+    label_x="Annees",
+    label_y="Valeur"
 ):
     """
     Genere un SVG simple (sans JS) pour afficher des courbes.
@@ -223,6 +226,31 @@ def generer_svg_courbes(
         x=int(marge), y=int(marge + 12), v=_echapper_xml(round(ymax, 2))
     ))
 
+    # Libelles axes
+    svg.append('<text x="{x}" y="{y}" fill="rgba(255,255,255,0.75)" font-family="Arial" font-size="12">{t}</text>'.format(
+        x=int(largeur / 2), y=int(hauteur - 6), t=_echapper_xml(label_x)
+    ))
+    svg.append('<text x="{x}" y="{y}" fill="rgba(255,255,255,0.75)" font-family="Arial" font-size="12" transform="rotate(-90 {x} {y})">{t}</text>'.format(
+        x=int(marge - 18), y=int(hauteur / 2), t=_echapper_xml(label_y)
+    ))
+
+    # Labels X (annees)
+    xs_uniques = sorted(set([float(x) for x in xs]))
+    if xs_uniques:
+        xmin_label = xs_uniques[0]
+        xmax_label = xs_uniques[-1]
+        if xmax_label == xmin_label:
+            pas_label = 1
+        else:
+            pas_label = max(1, int(round((xmax_label - xmin_label) / 8)))
+        annee = xmin_label
+        while annee <= xmax_label:
+            x_pos = proj_x(annee)
+            svg.append('<text x="{x}" y="{y}" fill="rgba(255,255,255,0.65)" font-family="Arial" font-size="11" text-anchor="middle">{t}</text>'.format(
+                x=int(x_pos), y=int(hauteur - 18), t=_echapper_xml(int(annee))
+            ))
+            annee += pas_label
+
     # Tracer chaque serie
     idx = 0
     legend_y = marge + 18
@@ -251,6 +279,22 @@ def generer_svg_courbes(
                 s=style
             ))
 
+        # Points (info au survol)
+        for (x, y) in pts:
+            try:
+                px = proj_x(x)
+                py = proj_y(y)
+                tooltip = "{} • {}: {}".format(
+                    _echapper_xml(nom),
+                    _echapper_xml(int(x) if float(x).is_integer() else x),
+                    _echapper_xml(round(float(y), 2))
+                )
+                svg.append('<circle cx="{x}" cy="{y}" r="3" fill="rgba(255,255,255,0.35)"><title>{t}</title></circle>'.format(
+                    x=int(px), y=int(py), t=tooltip
+                ))
+            except Exception:
+                pass
+
         # Legende (simple)
         svg.append('<rect x="{x}" y="{y}" width="12" height="12" fill="none" stroke="rgba(255,255,255,0.12)"/>'.format(
             x=legend_x, y=int(legend_y - 10)
@@ -263,6 +307,24 @@ def generer_svg_courbes(
             t=_echapper_xml(nom)
         ))
         legend_y += 18
+
+    # Evenements (points speciaux)
+    for evt in (evenements or []):
+        try:
+            x_evt = float(evt.get("x"))
+            y_evt = float(evt.get("y"))
+        except Exception:
+            continue
+        px = proj_x(x_evt)
+        py = proj_y(y_evt)
+        titre = _echapper_xml(evt.get("titre", "Evenement"))
+        details = _echapper_xml(evt.get("details", ""))
+        tooltip_evt = titre if not details else "{} • {}".format(titre, details)
+        svg.append(
+            '<circle cx="{x}" cy="{y}" r="6" fill="rgba(255,216,106,0.95)" stroke="rgba(255,255,255,0.9)" stroke-width="1.4"><title>{t}</title></circle>'.format(
+                x=int(px), y=int(py), t=tooltip_evt
+            )
+        )
 
     svg.append('</svg>')
     return "\n".join(svg)
