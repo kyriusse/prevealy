@@ -502,6 +502,9 @@ if faire_probabilite < 0.0:
 if faire_probabilite > 1.0:
     faire_probabilite = 1.0
 
+# Parametre U (objet d'evenement, utile pour EA)
+parametre_u = (lire_parametre_get("parametre_u", "") or "").strip()
+
 
 # ============================================================
 # Messages UI
@@ -648,6 +651,10 @@ if action == "creer":
             # Probabilite de declenchement de la regle (optionnelle)
             parametres.append(("regle_probabilite", str(regle_probabilite)))
 
+            # Parametre U (optionnel, objet d'evenement)
+            if parametre_u:
+                parametres.append(("parametre_u", parametre_u))
+
             # Condition: on impose un evenement A + etat
             if si_evenement_id is None:
                 message_erreur = "Algorithmique: choisis l evenement A (condition)."
@@ -711,7 +718,7 @@ if recherche_objet and table_stat_objects_ok and colonne_id_objet and colonne_no
 # ============================================================
 lien_retour_univers = "/cgi-bin/univers_dashboard.py?uid=" + uid_encode
 lien_retour_liaison = "/cgi-bin/liaison.py?uid=" + uid_encode
-lien_menu_simulation = "/cgi-bin/simulation.py?uid=" + uid_encode
+lien_menu_simulation = "/cgi-bin/menu_simulation.py?uid=" + uid_encode
 
 
 # ============================================================
@@ -1211,6 +1218,10 @@ if mode == "Ea":
           <label class="label">Probabilite de declenchement (0..1) (optionnel)</label>
           <input class="champ-texte" type="text" name="regle_probabilite" value="{echapper_html(regle_probabilite_str)}"
                  placeholder="Ex: 0.6">
+
+          <label class="label">Parametre U (optionnel)</label>
+          <input class="champ-texte" type="text" name="parametre_u" value="{echapper_html(parametre_u)}"
+                 placeholder="Ex: U">
 
           <details open style="margin-top:10px;">
             <summary>Si ...</summary>
