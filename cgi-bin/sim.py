@@ -15,8 +15,6 @@ But:
 Contraintes:
 - CGI pur
 - Sans JavaScript
-- Variables et fonctions en francais
-- Beaucoup de commentaires
 """
 
 import os
