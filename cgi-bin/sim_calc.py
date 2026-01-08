@@ -14,7 +14,7 @@ from stats_utils import facteur_speculation, facteur_utilisation
 
 
 # ============================================================
-# Constantes moteur (faciles a regler plus tard)
+# Constantes moteur
 # ============================================================
 
 # Limite de propagation dans le reseau (liaisons_objets)

@@ -7,7 +7,6 @@ evenement.py
 PAGE "EVENEMENT" (univers) - version plus simple + exploitable pour les simulations.
 
 - Ep (Parametrique):
-  - On n oblige PLUS a selectionner des objets.
   - "Appliquer a" (portee) avec choix:
       * tout (defaut si rien)
       * famille (1 famille)

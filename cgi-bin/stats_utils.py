@@ -119,7 +119,7 @@ def generer_svg_courbes(
     label_y="Valeur"
 ):
     """
-    Genere un SVG simple (sans JS) pour afficher des courbes.
+    Genere un SVG pour afficher des courbes.
 
     Parametre:
     - series: dict { "NomSerie": [(x, y), (x, y), ...], ... }
