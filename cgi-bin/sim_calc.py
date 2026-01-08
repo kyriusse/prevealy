@@ -214,6 +214,108 @@ def voisins_objet(connexion, objet_id):
         return []
 
 
+def voisins_evenement(connexion, evenement_id):
+    """
+    Retourne la liste des evenements lies via liaisons_applicables (type E).
+    Retour: liste de tuples (evenement_id, poids_liaison)
+    """
+    cur = connexion.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT source_id, cible_id, implication, poids, probabilite
+            FROM liaisons_applicables
+            WHERE type_applicable = 'E' AND (source_id = ? OR cible_id = ?)
+            """,
+            (evenement_id, evenement_id)
+        )
+        voisins_map = {}
+        for sid, cid, impl, poids, probabilite in cur.fetchall():
+            poids_liaison = _float_robuste(poids, 1.0) * _float_robuste(probabilite, 1.0)
+            poids_liaison = max(0.0, min(1.0, poids_liaison))
+            if sid == evenement_id:
+                voisins_map[cid] = max(poids_liaison, voisins_map.get(cid, 0.0))
+            elif impl == "<->" and cid == evenement_id:
+                voisins_map[sid] = max(poids_liaison, voisins_map.get(sid, 0.0))
+        return [(vid, poids) for vid, poids in voisins_map.items()]
+    except Exception:
+        return []
+
+
+def calculer_propagation_evenements(connexion, evenements_depart, profondeur_max=PROFONDEUR_RESEAU_MAX, attenuation=1.0):
+    """
+    Propagation BFS d activation d evenements lies.
+    Retour: dict evenement_id -> poids_activation
+    """
+    if profondeur_max < 0:
+        profondeur_max = 0
+    if attenuation < 0.0:
+        attenuation = 0.0
+    if attenuation > 1.0:
+        attenuation = 1.0
+
+    resultat = {}
+    file_bfs = []
+
+    for eid in (evenements_depart or []):
+        resultat[eid] = 1.0
+        file_bfs.append((eid, 0, 1.0))
+
+    while file_bfs:
+        courant, niv, poids_courant = file_bfs.pop(0)
+
+        if niv >= profondeur_max:
+            continue
+
+        niv_suiv = niv + 1
+        base_poids = _float_robuste(poids_courant, 1.0) * _float_robuste(attenuation, 1.0)
+        if base_poids <= 0.0:
+            continue
+
+        for v, poids_liaison in voisins_evenement(connexion, courant):
+            if v is None:
+                continue
+            poids_suiv = base_poids * _float_robuste(poids_liaison, 1.0)
+            poids_suiv = max(0.0, min(1.0, poids_suiv))
+            if poids_suiv <= 0.0:
+                continue
+            if v not in resultat or poids_suiv > resultat[v]:
+                resultat[v] = poids_suiv
+                file_bfs.append((v, niv_suiv, poids_suiv))
+
+    return resultat
+
+
+def etendre_evenements_lies(connexion, evenements_planifies):
+    """Etend les evenements planifies avec leurs liaisons d activation."""
+    if not evenements_planifies:
+        return []
+
+    depart = [eid for (eid, _cp, _cc) in evenements_planifies]
+    propagation = calculer_propagation_evenements(connexion, depart)
+
+    base_coeffs = {}
+    for (eid, coef_prix, coef_ca) in evenements_planifies:
+        if eid in base_coeffs:
+            prev_prix, prev_ca = base_coeffs[eid]
+            if abs(_float_robuste(coef_prix, 1.0)) > abs(_float_robuste(prev_prix, 1.0)):
+                prev_prix = coef_prix
+            if abs(_float_robuste(coef_ca, 1.0)) > abs(_float_robuste(prev_ca, 1.0)):
+                prev_ca = coef_ca
+            base_coeffs[eid] = (prev_prix, prev_ca)
+        else:
+            base_coeffs[eid] = (coef_prix, coef_ca)
+
+    evenements_etendus = []
+    for eid, poids in propagation.items():
+        coef_prix, coef_ca = base_coeffs.get(eid, (1.0, 1.0))
+        coef_prix = _float_robuste(coef_prix, 1.0) * _float_robuste(poids, 1.0)
+        coef_ca = _float_robuste(coef_ca, 1.0) * _float_robuste(poids, 1.0)
+        evenements_etendus.append((eid, coef_prix, coef_ca))
+
+    return evenements_etendus
+
+
 def calculer_propagation_reseau(connexion, objets_depart, profondeur_max=PROFONDEUR_RESEAU_MAX, attenuation=ATTENUATION_RESEAU):
     """
     Propagation BFS:
@@ -740,9 +842,10 @@ def executer_simulation(
             for oid in etat.keys():
                 appliquer_croissance_annuelle(etat[oid])
 
-        # 2) appliquer evenements prevus cette annee
+        # 2) appliquer evenements prevus cette annee (avec liaisons d activation)
         if pas in planning_index:
-            for (eid, coef_prix, coef_ca) in planning_index[pas]:
+            evenements_a_appliquer = etendre_evenements_lies(connexion, planning_index[pas])
+            for (eid, coef_prix, coef_ca) in evenements_a_appliquer:
                 evt = lire_evenement(connexion, eid)
                 impacts = lire_impacts_evenement(connexion, eid)
                 params_evt = lire_parametres_evenement(connexion, eid)
