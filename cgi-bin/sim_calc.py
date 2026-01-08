@@ -178,26 +178,29 @@ def voisins_objet(connexion, objet_id):
     """
     Retourne la liste des voisins directs d un objet via liaisons_objets.
     IMPORTANT: on suppose la table creee par liaison.py
+    Retour: liste de tuples (voisin_id, poids_liaison)
     """
     cur = connexion.cursor()
     try:
         # Priorite: table liaisons_applicables (nouveau)
         cur.execute(
             """
-            SELECT source_id, cible_id, implication
+            SELECT source_id, cible_id, implication, poids, probabilite
             FROM liaisons_applicables
             WHERE type_applicable = 'O' AND (source_id = ? OR cible_id = ?)
             """,
             (objet_id, objet_id)
         )
-        voisins = []
-        for sid, cid, impl in cur.fetchall():
+        voisins_map = {}
+        for sid, cid, impl, poids, probabilite in cur.fetchall():
+            poids_liaison = _float_robuste(poids, 1.0) * _float_robuste(probabilite, 1.0)
+            poids_liaison = max(0.0, min(1.0, poids_liaison))
             if sid == objet_id:
-                voisins.append(cid)
+                voisins_map[cid] = max(poids_liaison, voisins_map.get(cid, 0.0))
             elif impl == "<->" and cid == objet_id:
-                voisins.append(sid)
-        if voisins:
-            return list(dict.fromkeys(voisins))
+                voisins_map[sid] = max(poids_liaison, voisins_map.get(sid, 0.0))
+        if voisins_map:
+            return [(vid, poids) for vid, poids in voisins_map.items()]
     except Exception:
         pass
 
@@ -206,7 +209,7 @@ def voisins_objet(connexion, objet_id):
             "SELECT cible_objet_id FROM liaisons_objets WHERE source_objet_id = ?",
             (objet_id,)
         )
-        return [r[0] for r in cur.fetchall()]
+        return [(r[0], 1.0) for r in cur.fetchall()]
     except Exception:
         return []
 
@@ -233,31 +236,38 @@ def calculer_propagation_reseau(connexion, objets_depart, profondeur_max=PROFOND
 
     for oid in (objets_depart or []):
         resultat[oid] = (0, 1.0)
-        file_bfs.append((oid, 0))
+        file_bfs.append((oid, 0, 1.0))
 
     # BFS classique
     while file_bfs:
-        courant, niv = file_bfs.pop(0)
+        courant, niv, poids_courant = file_bfs.pop(0)
 
         if niv >= profondeur_max:
             continue
 
         niv_suiv = niv + 1
-        poids_suiv = (attenuation ** niv_suiv)
+        base_poids = _float_robuste(poids_courant, 1.0) * _float_robuste(attenuation, 1.0)
+        if base_poids <= 0.0:
+            continue
 
-        for v in voisins_objet(connexion, courant):
+        for v, poids_liaison in voisins_objet(connexion, courant):
             if v is None:
+                continue
+
+            poids_suiv = base_poids * _float_robuste(poids_liaison, 1.0)
+            poids_suiv = max(0.0, min(1.0, poids_suiv))
+            if poids_suiv <= 0.0:
                 continue
 
             if v not in resultat:
                 resultat[v] = (niv_suiv, poids_suiv)
-                file_bfs.append((v, niv_suiv))
+                file_bfs.append((v, niv_suiv, poids_suiv))
             else:
                 ancien_niv, ancien_poids = resultat[v]
                 # Garder le plus proche, ou le plus fort a niveau egal
                 if niv_suiv < ancien_niv:
                     resultat[v] = (niv_suiv, poids_suiv)
-                    file_bfs.append((v, niv_suiv))
+                    file_bfs.append((v, niv_suiv, poids_suiv))
                 elif niv_suiv == ancien_niv and poids_suiv > ancien_poids:
                     resultat[v] = (niv_suiv, poids_suiv)
 
@@ -589,6 +599,7 @@ def appliquer_evenement_parametrique(
     elif action_param == "mult_prix_moyen":
         coef_prix_action *= _float_robuste(valeur_param, 1.0)
     elif action_param == "delta_prix_moyen":
+        coef_prix_action = 1.0
         delta_prix = _float_robuste(valeur_param, 0.0)
     elif action_param == "mult_CA":
         coef_ca_action *= _float_robuste(valeur_param, 1.0)

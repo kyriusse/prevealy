@@ -167,8 +167,17 @@ def lister_evenements_details(conn):
     """Liste les evenements avec description pour usage simulation."""
     cur = conn.cursor()
     try:
-        cur.execute("SELECT id, nom, description FROM evenements ORDER BY id DESC")
-        return cur.fetchall()
+        colonnes = colonnes_evenements(conn)
+        champs = ["id", "nom", "description"]
+        if "type_evenement" in colonnes:
+            champs.append("type_evenement")
+        if "type_detail" in colonnes:
+            champs.append("type_detail")
+        if "afficher_simulation" in colonnes:
+            champs.append("afficher_simulation")
+        cur.execute("SELECT {} FROM evenements ORDER BY id DESC".format(", ".join(champs)))
+        lignes = cur.fetchall()
+        return [dict(zip(champs, lig)) for lig in lignes]
     except Exception:
         return []
 
@@ -193,6 +202,16 @@ def lire_parametres_evenements(conn, ids_evenements):
         if cle:
             params[evt_id][str(cle)] = valeur
     return params
+
+
+def colonnes_evenements(conn):
+    """Liste des colonnes disponibles dans evenements."""
+    cur = conn.cursor()
+    try:
+        cur.execute("PRAGMA table_info(evenements)")
+        return {c[1] for c in cur.fetchall() if c[1]}
+    except Exception:
+        return set()
 
 
 # ============================================================
@@ -393,8 +412,17 @@ def lister_evenements(conn):
     """Liste evenements recents."""
     cur = conn.cursor()
     try:
-        cur.execute("SELECT id, nom FROM evenements ORDER BY id DESC LIMIT 120")
-        return cur.fetchall()
+        colonnes = colonnes_evenements(conn)
+        champs = ["id", "nom"]
+        if "type_evenement" in colonnes:
+            champs.append("type_evenement")
+        if "type_detail" in colonnes:
+            champs.append("type_detail")
+        if "afficher_simulation" in colonnes:
+            champs.append("afficher_simulation")
+        cur.execute("SELECT {} FROM evenements ORDER BY id DESC LIMIT 120".format(", ".join(champs)))
+        lignes = cur.fetchall()
+        return [dict(zip(champs, lig)) for lig in lignes]
     except Exception:
         return []
 
@@ -404,13 +432,13 @@ paternes = lister_paternes(connexion)
 paternes_map = {int(pid): {"nom": nom, "description": desc} for (pid, nom, desc) in paternes}
 
 evenements_details = lister_evenements_details(connexion)
-evenements_ids = [int(eid) for (eid, _, _) in evenements_details if str(eid).isdigit()]
+evenements_ids = [int(evt["id"]) for evt in evenements_details if str(evt.get("id", "")).isdigit()]
 parametres_par_evenement = lire_parametres_evenements(connexion, evenements_ids)
 evenements_map = {}
-for eid, nom, desc in evenements_details:
-    eid_int = int(eid)
+for evt in evenements_details:
+    eid_int = int(evt["id"])
     params_evt = parametres_par_evenement.get(eid_int, {})
-    desc_finale = desc or params_evt.get("description") or ""
+    desc_finale = evt.get("description") or params_evt.get("description") or ""
     paterne_id = params_evt.get("paterne_id")
     paterne_nom = ""
     paterne_desc = ""
@@ -419,11 +447,17 @@ for eid, nom, desc in evenements_details:
         if paterne:
             paterne_nom = paterne.get("nom", "")
             paterne_desc = paterne.get("description", "")
+    type_detail = evt.get("type_detail") or ""
+    type_evenement = evt.get("type_evenement") or ""
+    afficher_sim = evt.get("afficher_simulation")
     evenements_map[eid_int] = {
-        "nom": nom,
+        "nom": evt.get("nom") or "",
         "description": desc_finale,
         "paterne_nom": paterne_nom,
         "paterne_description": paterne_desc,
+        "type_detail": type_detail,
+        "type_evenement": type_evenement,
+        "afficher_simulation": afficher_sim,
     }
 
 
@@ -501,7 +535,7 @@ if action == "simuler":
                 pts_ca_total.append((annee, resultat_simulation.get("ca_total", [])[i]))
 
             series = {
-                "Prix moyen total": pts_prix_total
+                "Prix total": pts_prix_total
             }
 
             # Afficher le CA seulement si non nul
@@ -523,18 +557,22 @@ if action == "simuler":
                 desc_evt = infos_evt.get("description") or ""
                 paterne_evt = infos_evt.get("paterne_nom") or ""
                 paterne_desc_evt = infos_evt.get("paterne_description") or ""
+                type_evt = infos_evt.get("type_detail") or infos_evt.get("type_evenement") or ""
                 planning_details.append({
                     "annee": annee_evt,
                     "nom": nom_evt,
                     "description": desc_evt,
                     "paterne": paterne_evt,
                     "paterne_description": paterne_desc_evt,
+                    "type": type_evt,
                     "coef_prix": cp,
                     "coef_ca": cc
                 })
                 if valeur_evt is None:
                     continue
                 details_evt = "Annee {} | Coef prix {} | Coef CA {}".format(annee_evt, cp, cc)
+                if type_evt:
+                    details_evt += " | Type: {}".format(type_evt)
                 if paterne_evt:
                     details_evt += " | Paterne: {}".format(paterne_evt)
                 if desc_evt:
@@ -1004,9 +1042,16 @@ print("""
         <option value="">(choisir)</option>
 """)
 
-for eid, nom_evt in liste_evenements:
-    print('<option value="{id}">{nom} (# {id})</option>'.format(
-        id=int(eid), nom=echapper_html(nom_evt)
+for evt in liste_evenements:
+    afficher_sim = evt.get("afficher_simulation")
+    if afficher_sim is not None and int(afficher_sim) != 1:
+        continue
+    type_detail = evt.get("type_detail") or evt.get("type_evenement") or ""
+    type_label = " [{}]".format(type_detail) if type_detail else ""
+    print('<option value="{id}">{nom}{type_label} (# {id})</option>'.format(
+        id=int(evt["id"]),
+        nom=echapper_html(evt.get("nom") or ""),
+        type_label=echapper_html(type_label)
     ))
 
 print("""
@@ -1034,14 +1079,19 @@ if not planning:
     print('<div class="message">Aucun evenement planifie.</div>')
 else:
     print('<table class="table">')
-    print('<tr><th>#</th><th>Evenement</th><th>Paterne</th><th>Annee</th><th>Coef prix</th><th>Coef CA</th><th></th></tr>')
+    print('<tr><th>#</th><th>Evenement</th><th>Type</th><th>Paterne</th><th>Annee</th><th>Coef prix</th><th>Coef CA</th><th></th></tr>')
     # Build map id->nom
     map_evt = {}
-    for eid, nom_evt in liste_evenements:
-        map_evt[int(eid)] = str(nom_evt)
+    for evt in liste_evenements:
+        map_evt[int(evt["id"])] = {
+            "nom": evt.get("nom") or "",
+            "type_detail": evt.get("type_detail") or evt.get("type_evenement") or ""
+        }
 
     for i, (ar, eid, cp, cc) in enumerate(planning):
-        nom_evt = map_evt.get(int(eid), "Evenement")
+        infos_evt = map_evt.get(int(eid), {})
+        nom_evt = infos_evt.get("nom") or "Evenement"
+        type_evt = infos_evt.get("type_detail") or "-"
         paterne_evt = evenements_map.get(int(eid), {}).get("paterne_nom") or "-"
         lien_suppr = (
             "/cgi-bin/sim.py?uid={uid}"
@@ -1069,6 +1119,7 @@ else:
         <tr>
           <td>{i}</td>
           <td>{nom} <span class="petit">(# {eid})</span></td>
+          <td>{type_evt}</td>
           <td>{paterne}</td>
           <td>{ar}</td>
           <td>{cp}</td>
@@ -1078,6 +1129,7 @@ else:
         """.format(
             i=echapper_html(i),
             nom=echapper_html(nom_evt),
+            type_evt=echapper_html(type_evt),
             paterne=echapper_html(paterne_evt),
             eid=echapper_html(eid),
             ar=echapper_html(ar),
@@ -1135,14 +1187,14 @@ print('<div class="ligne-actions" style="margin-top:16px;"><a class="bouton" hre
 # Affichage resultat (SVG + tableau)
 if resultat_simulation:
     print('<h2 style="margin-top:20px;">Resultat</h2>')
-    print('<div class="message">Courbe globale (prix moyen total, et CA total si disponible).</div>')
+    print('<div class="message">Courbe globale (prix total, et CA total si disponible).</div>')
     if svg:
         print('<div style="margin-top:10px; border-radius:18px; overflow:hidden; border:1px solid rgba(255,255,255,0.10);">{}</div>'.format(svg))
 
     if planning_details:
         print('<div class="message" style="margin-top:14px;">Evenements et paternes du planning</div>')
         print('<table class="table">')
-        print('<tr><th>Annee</th><th>Evenement</th><th>Paterne</th><th>Coef prix</th><th>Coef CA</th><th>Infos</th></tr>')
+        print('<tr><th>Annee</th><th>Evenement</th><th>Type</th><th>Paterne</th><th>Coef prix</th><th>Coef CA</th><th>Infos</th></tr>')
         for evt in planning_details:
             info_parts = []
             if evt.get("description"):
@@ -1150,9 +1202,10 @@ if resultat_simulation:
             if evt.get("paterne_description"):
                 info_parts.append("Paterne: {}".format(evt["paterne_description"]))
             info_txt = " | ".join(info_parts)
-            print('<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
+            print('<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
                 echapper_html(evt.get("annee")),
                 echapper_html(evt.get("nom")),
+                echapper_html(evt.get("type") or "-"),
                 echapper_html(evt.get("paterne") or "-"),
                 echapper_html(evt.get("coef_prix")),
                 echapper_html(evt.get("coef_ca")),
@@ -1168,7 +1221,7 @@ if resultat_simulation:
     print('<details style="margin-top:12px; padding:10px 12px; border-radius:14px; background: rgba(0,0,0,0.18); border: 1px solid rgba(255,255,255,0.10);" open>')
     print('<summary style="cursor:pointer;">Tableau global (par annee)</summary>')
     print('<table class="table">')
-    print('<tr><th>Annee</th><th>Prix moyen total</th><th>CA total</th></tr>')
+    print('<tr><th>Annee</th><th>Prix total</th><th>CA total</th></tr>')
     for i in range(0, len(annees)):
         print('<tr><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
             echapper_html(annees[i]),
