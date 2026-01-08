@@ -536,6 +536,19 @@ if action == "simuler":
                 "Prix total": pts_prix_total
             }
 
+            # Courbes par objet selectionne
+            details_objets = resultat_simulation.get("details_objets", {})
+            if details_objets and len(details_objets) > 1:
+                for oid, infos in details_objets.items():
+                    nom_objet = infos.get("nom") or f"Objet {oid}"
+                    pts_prix_objet = infos.get("prix") or []
+                    if pts_prix_objet:
+                        series[f"Prix - {nom_objet}"] = pts_prix_objet
+
+                    pts_ca_objet = infos.get("ca") or []
+                    if pts_ca_objet and max([p[1] for p in pts_ca_objet]) > 0:
+                        series[f"CA - {nom_objet}"] = pts_ca_objet
+
             # Afficher le CA seulement si non nul
             if pts_ca_total and max([p[1] for p in pts_ca_total]) > 0:
                 series["CA total"] = pts_ca_total
