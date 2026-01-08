@@ -670,13 +670,14 @@ def _detail_lien(info):
 
 
 def construire_arbre_reseau_html(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, liaisons):
-    """Construit une vue "arbre" des liaisons reelles d'un reseau."""
+    """Construit une vue "arbre" claire des liaisons reelles d'un reseau."""
     if not liaisons:
         return '<div class="message">Aucune liaison a afficher.</div>'
 
     noeuds = set()
     entrants = {}
-    adjacency = {}
+    sorties = {}
+    equivalences = {}
 
     for (_lid, sid, cid, impl, _tl, _pw, _prob, _comm) in liaisons:
         info = {
@@ -689,10 +690,10 @@ def construire_arbre_reseau_html(type_applicable, connexion, colonne_id_objet, c
         entrants.setdefault(cid, 0)
 
         if impl == "<->":
-            adjacency.setdefault(sid, []).append((cid, "↔", info))
-            adjacency.setdefault(cid, []).append((sid, "↔", info))
+            equivalences.setdefault(sid, []).append((cid, info))
+            equivalences.setdefault(cid, []).append((sid, info))
         else:
-            adjacency.setdefault(sid, []).append((cid, "→", info))
+            sorties.setdefault(sid, []).append((cid, info))
             entrants[cid] = entrants.get(cid, 0) + 1
 
     if not noeuds:
@@ -705,36 +706,49 @@ def construire_arbre_reseau_html(type_applicable, connexion, colonne_id_objet, c
     def cle_tri(element_id):
         return nom_noeud(element_id).lower()
 
-    for node_id, voisins in adjacency.items():
+    for node_id, voisins in sorties.items():
+        voisins.sort(key=lambda v: cle_tri(v[0]))
+    for node_id, voisins in equivalences.items():
         voisins.sort(key=lambda v: cle_tri(v[0]))
 
     racines = sorted([n for n in noeuds if entrants.get(n, 0) == 0], key=cle_tri)
     if not racines:
         racines = sorted(list(noeuds), key=cle_tri)
 
-    def rendre_noeud(element_id, chemin, prefixe_html):
-        etiquette = f"{prefixe_html}{echapper_html(nom_noeud(element_id))}"
+    def rendre_equivalences(element_id):
+        voisins = equivalences.get(element_id, [])
+        if not voisins:
+            return ""
+        items = []
+        for (voisin_id, info) in voisins:
+            detail = echapper_html(_detail_lien(info))
+            items.append(f"{echapper_html(nom_noeud(voisin_id))}{detail}")
+        return "<div class='arbre-equivalence'>↔ " + ", ".join(items) + "</div>"
+
+    def rendre_noeud(element_id, chemin, prefixe_html=""):
+        etiquette = f"{prefixe_html}<span class='arbre-noeud'>{echapper_html(nom_noeud(element_id))}</span>"
         if element_id in chemin:
             return f"<li>{etiquette} <span class='petit'>(cycle)</span></li>"
 
-        enfants = adjacency.get(element_id, [])
+        enfants = sorties.get(element_id, [])
+        html = f"<li>{etiquette}{rendre_equivalences(element_id)}"
         if not enfants:
-            return f"<li>{etiquette}</li>"
+            html += "</li>"
+            return html
 
         nouveau_chemin = set(chemin)
         nouveau_chemin.add(element_id)
-        html = f"<li>{etiquette}<ul>"
-        for (enfant_id, fleche, info) in enfants:
+        html += "<ul>"
+        for (enfant_id, info) in enfants:
             detail = echapper_html(_detail_lien(info))
-            fleche_html = f"<span class='arbre-lien'>{echapper_html(fleche)}</span> "
-            etiquette_enfant = f"{fleche_html}{echapper_html(nom_noeud(enfant_id))}{detail}"
-            html += rendre_noeud(enfant_id, nouveau_chemin, etiquette_enfant)
+            fleche_html = f"<span class='arbre-lien'>→</span>{detail} "
+            html += rendre_noeud(enfant_id, nouveau_chemin, fleche_html)
         html += "</ul></li>"
         return html
 
-    html = "<div class='arbre-reseau'><ul>"
+    html = "<div class='arbre-reseau'><ul class='arbre-niveau'>"
     for racine in racines:
-        html += rendre_noeud(racine, set(), "")
+        html += rendre_noeud(racine, set())
     html += "</ul></div>"
     return html
 
@@ -1309,16 +1323,39 @@ summary {{
 .arbre-reseau ul {{
   list-style: none;
   margin: 6px 0 6px 18px;
-  padding-left: 12px;
-  border-left: 1px solid rgba(255,255,255,0.10);
+  padding-left: 18px;
+  border-left: 1px solid rgba(255,255,255,0.16);
 }}
 .arbre-reseau li {{
-  margin: 6px 0;
+  margin: 8px 0;
   line-height: 1.4;
+  position: relative;
+  padding-left: 10px;
+}}
+.arbre-reseau li:before {{
+  content: "";
+  position: absolute;
+  left: -18px;
+  top: 12px;
+  width: 18px;
+  height: 1px;
+  background: rgba(255,255,255,0.16);
 }}
 .arbre-lien {{
   color: #FFD86A;
   font-weight: bold;
+}}
+.arbre-noeud {{
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(255,216,106,0.12);
+  border: 1px solid rgba(255,216,106,0.35);
+}}
+.arbre-equivalence {{
+  margin-top: 4px;
+  font-size: 12px;
+  opacity: 0.9;
 }}
 </style>
 </head>
