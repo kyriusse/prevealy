@@ -669,6 +669,76 @@ def _detail_lien(info):
     return " (" + ", ".join(morceaux) + ")" if morceaux else ""
 
 
+def construire_arbre_reseau_html(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, liaisons):
+    """Construit une vue "arbre" des liaisons reelles d'un reseau."""
+    if not liaisons:
+        return '<div class="message">Aucune liaison a afficher.</div>'
+
+    noeuds = set()
+    entrants = {}
+    adjacency = {}
+
+    for (_lid, sid, cid, impl, _tl, _pw, _prob, _comm) in liaisons:
+        info = {
+            "poids": _pw,
+            "probabilite": _prob
+        }
+        noeuds.add(sid)
+        noeuds.add(cid)
+        entrants.setdefault(sid, 0)
+        entrants.setdefault(cid, 0)
+
+        if impl == "<->":
+            adjacency.setdefault(sid, []).append((cid, "↔", info))
+            adjacency.setdefault(cid, []).append((sid, "↔", info))
+        else:
+            adjacency.setdefault(sid, []).append((cid, "→", info))
+            entrants[cid] = entrants.get(cid, 0) + 1
+
+    if not noeuds:
+        return '<div class="message">Reseau vide.</div>'
+
+    def nom_noeud(element_id):
+        nom = nom_element(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, element_id)
+        return nom if nom else ("#" + str(element_id))
+
+    def cle_tri(element_id):
+        return nom_noeud(element_id).lower()
+
+    for node_id, voisins in adjacency.items():
+        voisins.sort(key=lambda v: cle_tri(v[0]))
+
+    racines = sorted([n for n in noeuds if entrants.get(n, 0) == 0], key=cle_tri)
+    if not racines:
+        racines = sorted(list(noeuds), key=cle_tri)
+
+    def rendre_noeud(element_id, chemin, prefixe_html):
+        etiquette = f"{prefixe_html}{echapper_html(nom_noeud(element_id))}"
+        if element_id in chemin:
+            return f"<li>{etiquette} <span class='petit'>(cycle)</span></li>"
+
+        enfants = adjacency.get(element_id, [])
+        if not enfants:
+            return f"<li>{etiquette}</li>"
+
+        nouveau_chemin = set(chemin)
+        nouveau_chemin.add(element_id)
+        html = f"<li>{etiquette}<ul>"
+        for (enfant_id, fleche, info) in enfants:
+            detail = echapper_html(_detail_lien(info))
+            fleche_html = f"<span class='arbre-lien'>{echapper_html(fleche)}</span> "
+            etiquette_enfant = f"{fleche_html}{echapper_html(nom_noeud(enfant_id))}{detail}"
+            html += rendre_noeud(enfant_id, nouveau_chemin, etiquette_enfant)
+        html += "</ul></li>"
+        return html
+
+    html = "<div class='arbre-reseau'><ul>"
+    for racine in racines:
+        html += rendre_noeud(racine, set(), "")
+    html += "</ul></div>"
+    return html
+
+
 # ============================================================
 # Chargement contexte univers
 # ============================================================
@@ -1235,6 +1305,21 @@ summary {{
   border-bottom: 1px solid rgba(255,255,255,0.08);
   vertical-align: top;
 }}
+
+.arbre-reseau ul {{
+  list-style: none;
+  margin: 6px 0 6px 18px;
+  padding-left: 12px;
+  border-left: 1px solid rgba(255,255,255,0.10);
+}}
+.arbre-reseau li {{
+  margin: 6px 0;
+  line-height: 1.4;
+}}
+.arbre-lien {{
+  color: #FFD86A;
+  font-weight: bold;
+}}
 </style>
 </head>
 
@@ -1544,15 +1629,18 @@ elif vue == "reseaux":
     else:
         # On affiche une liste de "cartes" reseau (sans JS, juste du HTML)
         for rid in reseaux_ids:
+            # Liaisons reelles du reseau
+            liaisons = []
+            try:
+                liaisons = liaisons_par_reseau(connexion, type_applicable, rid)
+            except Exception:
+                liaisons = []
+
             # Construire un texte lisible
             texte = resumer_reseau_lisible(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, rid)
 
             # Nombre de liaisons dans le reseau (utile pour savoir si c'est vide)
-            nb_liaisons = 0
-            try:
-                nb_liaisons = len(liaisons_par_reseau(connexion, type_applicable, rid))
-            except Exception:
-                nb_liaisons = 0
+            nb_liaisons = len(liaisons)
 
             # On ignore les reseaux totalement vides (cas rare)
             if nb_liaisons <= 0:
@@ -1564,6 +1652,11 @@ elif vue == "reseaux":
 
                 <div class="message" style="margin-top:10px;">
                   <strong>R{echapper_html(rid)}:</strong> {echapper_html(texte)}
+                </div>
+
+                <div class="message" style="margin-top:10px;">
+                  <strong>Arbre des liaisons fonctionnelles</strong> :
+                  {construire_arbre_reseau_html(type_applicable, connexion, colonne_id_objet, colonne_nom_objet, liaisons)}
                 </div>
 
                 <div class="petit">
