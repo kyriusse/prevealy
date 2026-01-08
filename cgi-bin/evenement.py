@@ -1178,7 +1178,7 @@ if mode == "Ep":
     actions = [
         ("coef_evolution", "Coef evolution (ex: 0.05 = +5%)"),
         ("mult_prix_moyen", "Multiplier prix moyen (ex: 1.10)"),
-        ("delta_prix_moyen", "Ajouter au prix moyen (ex: +2)"),
+        ("delta_prix_moyen", "Ajouter au prix moyen (ex: +2 ou -2)"),
         ("mult_CA", "Multiplier CA (ex: 0.80)"),
     ]
     for code, lib in actions:
