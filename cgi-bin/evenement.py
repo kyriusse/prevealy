@@ -6,7 +6,6 @@ evenement.py
 ------------
 PAGE "EVENEMENT" (univers) - version plus simple + exploitable pour les simulations.
 
-Changements demandes:
 - Ep (Parametrique):
   - On n oblige PLUS a selectionner des objets.
   - "Appliquer a" (portee) avec choix:
@@ -773,8 +772,7 @@ lien_menu_simulation = "/cgi-bin/menu_simulation.py?uid=" + uid_encode
 
 
 # ============================================================
-# HTML / CSS (mystique, clair)
-# NOTE: f-string => CSS doit doubler {{ }}
+# HTML / CSS 
 # ============================================================
 options_paternes = '<option value="">(aucun)</option>'
 for pid, nom, desc in liste_paternes:

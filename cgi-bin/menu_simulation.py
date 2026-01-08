@@ -6,14 +6,6 @@ simulation.py
 -------------
 Menu "Simulation" d'un univers.
 
-Demande:
-- Design sombre + PLUS mysterieux (plus "rituel", plus profond, plus atmospherique)
-- Toujours proche du style page d'accueil
-- Sans JavaScript
-- Variables en francais
-- Fichier tres commente
-- Ajouter des boutons visibles de redirection vers les pages (Acceder / Bientot)
-
 Notes:
 - Cette page ne calcule rien, c'est un menu.
 - L'uid est obligatoire (on est dans un univers).

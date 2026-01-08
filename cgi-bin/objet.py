@@ -6,14 +6,10 @@ import sys
 import math
 import sqlite3
 import urllib.parse
-import html
 
 from stats_utils import calculer_courbe_evolution
 
 print("Content-Type: text/html; charset=utf-8\n")
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-EVENTS_DB_PATH = os.path.join(BASE_DIR, "events.db")
 
 # ==================================================
 # Lecture des paramètres GET (remplace cgi)
@@ -50,42 +46,6 @@ if not row:
 colonnes = [desc[0] for desc in cur.description]
 data = dict(zip(colonnes, row))
 conn.close()
-
-# ---------- Evenements ----------
-def extraire_annee(date_str):
-    if not date_str:
-        return None
-    try:
-        return int(str(date_str)[:4])
-    except Exception:
-        return None
-
-
-def echapper_xml(texte):
-    if texte is None:
-        return ""
-    return html.escape(str(texte))
-
-
-evenements = []
-try:
-    conn_events = sqlite3.connect(EVENTS_DB_PATH)
-    cur_events = conn_events.cursor()
-    cur_events.execute("""
-        SELECT title, description, event_date
-        FROM events
-        ORDER BY event_date ASC, created_at ASC
-    """)
-    for title, description, event_date in cur_events.fetchall():
-        evenements.append({
-            "title": title or "Événement",
-            "description": description or "",
-            "event_date": event_date or "",
-            "event_year": extraire_annee(event_date),
-        })
-    conn_events.close()
-except Exception:
-    evenements = []
 
 # ---------- Courbe via stats_utils ----------
 courbe = calculer_courbe_evolution(
@@ -244,34 +204,6 @@ h1 {{
     padding: 20px;
     text-align: center;
 }}
-
-.event-list {{
-    margin-top: 12px;
-    text-align: left;
-    color: rgba(255,255,255,0.8);
-    font-size: 0.9em;
-}}
-
-.event-list h3 {{
-    margin: 10px 0 6px;
-    font-size: 1em;
-    color: #90EE90;
-}}
-
-.event-item {{
-    margin-bottom: 6px;
-    padding-bottom: 6px;
-    border-bottom: 1px dashed rgba(144,238,144,0.3);
-}}
-
-.event-item:last-child {{
-    border-bottom: none;
-}}
-
-.event-date {{
-    font-weight: bold;
-    color: #FFD86A;
-}}
 </style>
 </head>
 
@@ -319,43 +251,19 @@ print("""
 # SVG – VERSION ORIGINALE (INCHANGÉE)
 # ==================================================
 offset_y = 0
-annee_min = None
-annee_max = None
 
 if courbe:
     largeur, hauteur, marge = 280, 150, 25
-    svg_hauteur = hauteur + 30
     prix_min = min(p for _, p in courbe)
     prix_max = max(p for _, p in courbe)
     plage = prix_max - prix_min if prix_max != prix_min else 1
 
-    annee_min = courbe[0][0]
-    annee_max = courbe[-1][0]
-
-    def proj_x(annee):
-        return marge + ((annee - annee_min) / (annee_max - annee_min)) * (largeur - 2 * marge)
-
-    def proj_y(prix):
-        return hauteur - marge - ((prix - prix_min) / plage) * (hauteur - 2 * marge) + offset_y
-
-    def prix_pour_annee(annee):
-        for annee_point, prix_point in courbe:
-            if annee_point == annee:
-                return prix_point
-        for i in range(1, len(courbe)):
-            annee_0, prix_0 = courbe[i - 1]
-            annee_1, prix_1 = courbe[i]
-            if annee_0 <= annee <= annee_1:
-                ratio = (annee - annee_0) / (annee_1 - annee_0)
-                return prix_0 + (prix_1 - prix_0) * ratio
-        return None
-
     points = []
     x_2025 = None
 
-    for annee, prix in courbe:
-        x = proj_x(annee)
-        y = proj_y(prix)
+    for i, (annee, prix) in enumerate(courbe):
+        x = marge + i * (largeur - 2*marge) / (len(courbe)-1)
+        y = hauteur - marge - ((prix - prix_min) / plage) * (hauteur - 2*marge) + offset_y
         points.append(f"{x},{y}")
 
         if annee == 2025:
@@ -363,7 +271,7 @@ if courbe:
 
     print(f"""
 <svg width="100%" height="100%"
-     viewBox="0 0 {largeur} {svg_hauteur}"
+     viewBox="0 +20 {largeur} {hauteur}"
      preserveAspectRatio="none">
 
     <!-- Axes -->
@@ -376,99 +284,25 @@ if courbe:
           stroke="#90EE90"/>
 """)
 
-    for annee, _ in courbe:
-        x = proj_x(annee)
+    for i, (annee, _) in enumerate(courbe):
+        x = marge + i * (largeur - 2*marge) / (len(courbe)-1)
         print(f'<text x="{x-10}" y="{hauteur-5}" font-size="9" fill="#90EE90">{annee}</text>')
-
-    prix_milieu = round(prix_min + (plage / 2), 2)
-    y_milieu = proj_y(prix_milieu)
 
     print(f"""
     <text x="4" y="{marge+8}" font-size="9" fill="#90EE90">{round(prix_max,2)}</text>
-    <text x="4" y="{y_milieu+3}" font-size="9" fill="#90EE90">{prix_milieu}</text>
     <text x="4" y="{hauteur-marge}" font-size="9" fill="#90EE90">{round(prix_min,2)}</text>
-    <text x="{largeur/2-18}" y="{hauteur+20}" font-size="10" fill="#90EE90">Années</text>
-    <text x="10" y="{hauteur/2}" font-size="10" fill="#90EE90" transform="rotate(-90 10 {hauteur/2})">Prix (€)</text>
 
     <polyline
         points="{' '.join(points)}"
         fill="none"
         stroke="#90EE90"
         stroke-width="3"/>
-""")
-
-    for annee, prix in courbe:
-        x = proj_x(annee)
-        y = proj_y(prix)
-        tooltip = echapper_xml(f"Année {annee} • Prix {prix} €")
-        print(f"""
-    <circle cx="{x}" cy="{y}" r="6" fill="rgba(0,0,0,0)" stroke="none">
-        <title>{tooltip}</title>
-    </circle>
-""")
-
-    for evt in evenements:
-        annee_evt = evt.get("event_year")
-        if annee_evt is None:
-            continue
-        if annee_evt < annee_min or annee_evt > annee_max:
-            continue
-        prix_evt = prix_pour_annee(annee_evt)
-        if prix_evt is None:
-            continue
-        x_evt = proj_x(annee_evt)
-        y_evt = proj_y(prix_evt)
-        titre_evt = evt.get("title") or "Événement"
-        description_evt = evt.get("description") or ""
-        date_evt = evt.get("event_date") or str(annee_evt)
-        tooltip_evt = echapper_xml(f"{titre_evt} • {date_evt} • Prix {round(prix_evt, 2)} € {description_evt}".strip())
-        print(f"""
-    <circle cx="{x_evt}" cy="{y_evt}" r="4" fill="#FFD86A" stroke="#FFFFFF" stroke-width="1">
-        <title>{tooltip_evt}</title>
-    </circle>
-""")
-
-    if x_2025 is not None:
-        print(f"""
 
     <line x1="{x_2025}" y1="{marge}"
           x2="{x_2025}" y2="{hauteur-marge}"
           stroke="#ffffff"
           stroke-width="2"/>
-""")
-
-    print("""
 </svg>
-""")
-
-print("""
-        <div class="event-list">
-            <h3>Événements sur la période</h3>
-""")
-
-if evenements:
-    for evt in evenements:
-        titre_evt = html.escape(evt.get("title") or "Événement")
-        description_evt = html.escape(evt.get("description") or "")
-        date_evt = html.escape(evt.get("event_date") or "Date inconnue")
-        annee_evt = evt.get("event_year")
-        hors_periode = ""
-        if annee_evt is not None and annee_min is not None and annee_max is not None:
-            if annee_evt < annee_min or annee_evt > annee_max:
-                hors_periode = " (hors période)"
-        print(f"""
-            <div class="event-item">
-                <div class="event-date">{date_evt}{hors_periode}</div>
-                <div><strong>{titre_evt}</strong>{' - ' + description_evt if description_evt else ''}</div>
-            </div>
-        """)
-else:
-    print("""
-            <div class="event-item">Aucun événement enregistré.</div>
-    """)
-
-print("""
-        </div>
 """)
 
 print("""

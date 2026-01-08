@@ -127,8 +127,7 @@ def generer_svg_courbes(
     Sortie:
     - string contenant du SVG complet
 
-    Notes:
-    - Pas de couleurs imposees "artistiques"; on utilise des strokes differents simples.
+    Notes :
     - Si une serie est vide, elle n est pas tracee.
     """
 
