@@ -12,32 +12,35 @@ import os
 print("Content-Type: text/html; charset=utf-8\n")
 
 # 🔑 CLÉ UNSPLASH
-UNSPLASH_ACCESS_KEY = "Z-alaucSBZjnArcjCj3H0hWhxpt31Va448B0X4ozdzM"
+CLE_ACCES_UNSPLASH = "Z-alaucSBZjnArcjCj3H0hWhxpt31Va448B0X4ozdzM"
 
 # ---------- FONCTION TRADUCTION FR → EN (LibreTranslate) ----------
-def translate_fr_en(text):
+def traduire_fr_vers_en(texte):
+    """Traduit un texte du français vers l'anglais via LibreTranslate."""
     try:
-        data = urllib.parse.urlencode({
-            "q": text,
-            "source": "fr",
-            "target": "en",
-            "format": "text"
-        }).encode("utf-8")
+        donnees = urllib.parse.urlencode(
+            {
+                "q": texte,
+                "source": "fr",
+                "target": "en",
+                "format": "text",
+            }
+        ).encode("utf-8")
 
-        req = urllib.request.Request(
+        requete = urllib.request.Request(
             "https://libretranslate.com/translate",
-            data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"}
+            data=donnees,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
 
-        with urllib.request.urlopen(req, timeout=5) as response:
-            result = json.loads(response.read().decode("utf-8"))
-            return result.get("translatedText", text)
+        with urllib.request.urlopen(requete, timeout=5) as reponse:
+            resultat = json.loads(reponse.read().decode("utf-8"))
+            return resultat.get("translatedText", texte)
 
-    except:
-        return text
+    except Exception:
+        return texte
 
-# ---------- HTML HEADER ----------
+# ---------- ENTÊTE HTML ----------
 print("""
 <!DOCTYPE html>
 <html lang="fr">
@@ -94,43 +97,44 @@ a {
 """)
 
 # ---------- RÉCUP RECHERCHE ----------
-def get_param(name, default=""):
-    qs = os.environ.get("QUERY_STRING", "")
-    params = urllib.parse.parse_qs(qs, keep_blank_values=True)
-    return params.get(name, [default])[0]
+def recuperer_parametre(nom, defaut=""):
+    """Récupère un paramètre depuis la query string."""
+    chaine_requete = os.environ.get("QUERY_STRING", "")
+    parametres = urllib.parse.parse_qs(chaine_requete, keep_blank_values=True)
+    return parametres.get(nom, [defaut])[0]
 
-query = get_param("q")
+requete = recuperer_parametre("q")
 
-if not query:
+if not requete:
     print("<h2>Aucune recherche</h2></body></html>")
     sys.exit()
 
-query_lower = query.lower()
+requete_minuscule = requete.lower()
 
 # ---------- BDD ----------
-DB_PATH = "cgi-bin/objets.db"
-conn = sqlite3.connect(DB_PATH)
-cur = conn.cursor()
+CHEMIN_BDD = "cgi-bin/objets.db"
+connexion = sqlite3.connect(CHEMIN_BDD)
+curseur = connexion.cursor()
 
-cur.execute("SELECT Objet, Famille, Type FROM Prix_Objets")
-rows = cur.fetchall()
-objets = rows
+curseur.execute("SELECT Objet, Famille, Type FROM Prix_Objets")
+lignes = curseur.fetchall()
+objets = lignes
 
 # ---------- RECHERCHE TOLÉRANTE ----------
 resultats = []
 
-for objet, famille, type_ in objets:
-    score = 0
-    objet_lower = objet.lower()
+for objet, famille, type_objet in objets:
+    score_recherche = 0
+    objet_minuscule = objet.lower()
 
-    for mot in query_lower.split():
-        if mot in objet_lower:
-            score += 2
-        elif difflib.SequenceMatcher(None, mot, objet_lower).ratio() > 0.6:
-            score += 1
+    for mot in requete_minuscule.split():
+        if mot in objet_minuscule:
+            score_recherche += 2
+        elif difflib.SequenceMatcher(None, mot, objet_minuscule).ratio() > 0.6:
+            score_recherche += 1
 
-    if score > 0:
-        resultats.append((score, objet, famille, type_))
+    if score_recherche > 0:
+        resultats.append((score_recherche, objet, famille, type_objet))
         
 resultats.sort(reverse=True)
 resultats = resultats[:6]
@@ -141,37 +145,40 @@ if not resultats:
     sys.exit()
 
 # ---------- UNSPLASH ----------
-def get_unsplash_image(objet, famille, type_):
-    # 1Nettoyage : enlever les parenthèse
-    objet_clean = re.sub(r"\s*\(.*?\)", "", objet).strip()
+def recuperer_image_unsplash(objet, famille, type_objet):
+    """Récupère une image Unsplash en fonction de l'objet."""
+    # 1 Nettoyage : enlever les parenthèses
+    objet_nettoye = re.sub(r"\s*\(.*?\)", "", objet).strip()
 
-    # 2Traduction
-    objet_en = translate_fr_en(objet_clean)
-    famille_en = translate_fr_en(famille) if famille else ""
-    type_en = translate_fr_en(type_) if type_ else ""
+    # 2 Traduction
+    objet_en = traduire_fr_vers_en(objet_nettoye)
+    famille_en = traduire_fr_vers_en(famille) if famille else ""
+    type_en = traduire_fr_vers_en(type_objet) if type_objet else ""
 
     # 3 Construction requête intelligente
-    query = f"{objet_en} {type_en} {famille_en} product isolated"
+    requete = f"{objet_en} {type_en} {famille_en} product isolated"
 
     try:
-        params = urllib.parse.urlencode({
-            "query": query,
-            "per_page": 1,
-            "orientation": "squarish",
-            "content_filter": "high"
-        })
-
-        req = urllib.request.Request(
-            f"https://api.unsplash.com/search/photos?{params}",
-            headers={"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}
+        parametres_requete = urllib.parse.urlencode(
+            {
+                "query": requete,
+                "per_page": 1,
+                "orientation": "squarish",
+                "content_filter": "high",
+            }
         )
 
-        with urllib.request.urlopen(req, timeout=5) as response:
-            data = json.loads(response.read().decode("utf-8"))
-            if data.get("results"):
-                return data["results"][0]["urls"]["regular"]
+        requete_http = urllib.request.Request(
+            f"https://api.unsplash.com/search/photos?{parametres_requete}",
+            headers={"Authorization": f"Client-ID {CLE_ACCES_UNSPLASH}"},
+        )
 
-    except:
+        with urllib.request.urlopen(requete_http, timeout=5) as reponse:
+            donnees = json.loads(reponse.read().decode("utf-8"))
+            if donnees.get("results"):
+                return donnees["results"][0]["urls"]["regular"]
+
+    except Exception:
         pass
 
     return "/no_image.png"
@@ -179,13 +186,13 @@ def get_unsplash_image(objet, famille, type_):
 # ---------- AFFICHAGE ----------
 print("<div class='results'>")
 
-for _, objet, famille, type_ in resultats:
-    img = get_unsplash_image(objet, famille, type_)
+for _, objet, famille, type_objet in resultats:
+    image = recuperer_image_unsplash(objet, famille, type_objet)
 
     print(f"""
-    <a href="/cgi-bin/objet.py?nom={urllib.parse.quote(objet)}&img={urllib.parse.quote(img)}">
+    <a href="/cgi-bin/objet.py?nom={urllib.parse.quote(objet)}&img={urllib.parse.quote(image)}">
         <div class="card">
-            <img src="{img}">
+            <img src="{image}">
             <h2>{objet}</h2>
         </div>
     </a>
@@ -193,4 +200,4 @@ for _, objet, famille, type_ in resultats:
 
 print("</div>")
 print("</body></html>")
-conn.close()
+connexion.close()

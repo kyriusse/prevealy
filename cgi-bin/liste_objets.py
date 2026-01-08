@@ -8,246 +8,263 @@ import html
 
 print("Content-Type: text/html; charset=utf-8\n")
 
-UNIVERSE_DIR = "cgi-bin/universes/"
+REPERTOIRE_UNIVERS = "cgi-bin/universes/"
 
-def get_param(name, default=""):
-    qs = os.environ.get("QUERY_STRING", "")
-    params = urllib.parse.parse_qs(qs, keep_blank_values=True)
-    return params.get(name, [default])[0]
+def recuperer_parametre(nom, defaut=""):
+    """Récupère un paramètre depuis la query string."""
+    chaine_requete = os.environ.get("QUERY_STRING", "")
+    parametres = urllib.parse.parse_qs(chaine_requete, keep_blank_values=True)
+    return parametres.get(nom, [defaut])[0]
 
-def universe_path(universe_id):
-    safe = "".join([c for c in universe_id if c.isalnum() or c in ("-", "_")])
-    return os.path.join(UNIVERSE_DIR, f"universe_{safe}.db")
+def chemin_univers(identifiant_univers):
+    """Construit un chemin sécurisé vers une base d'univers."""
+    identifiant_securise = "".join(
+        [caractere for caractere in identifiant_univers if caractere.isalnum() or caractere in ("-", "_")]
+    )
+    return os.path.join(REPERTOIRE_UNIVERS, f"universe_{identifiant_securise}.db")
 
-def get_universe_name(universe_id):
+def recuperer_nom_univers(identifiant_univers):
+    """Retourne le nom d'un univers à partir de son identifiant."""
     try:
-        names_file = os.path.join(UNIVERSE_DIR, "univers_names.txt")
-        if os.path.exists(names_file):
-            with open(names_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    if "," in line:
-                        uid, name = line.strip().split(",", 1)
-                        if uid == universe_id:
-                            return name
+        fichier_noms = os.path.join(REPERTOIRE_UNIVERS, "univers_names.txt")
+        if os.path.exists(fichier_noms):
+            with open(fichier_noms, "r", encoding="utf-8") as fichier:
+                for ligne in fichier:
+                    if "," in ligne:
+                        identifiant, nom = ligne.strip().split(",", 1)
+                        if identifiant == identifiant_univers:
+                            return nom
     except Exception:
         pass
     return "Nom inconnu"
 
-def get_table_info(u_path, table_name):
-    conn = sqlite3.connect(u_path)
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table_name})")
-    info = cur.fetchall()
-    conn.close()
-    return info
+def recuperer_infos_table(chemin_bdd, nom_table):
+    """Récupère les informations de colonnes d'une table."""
+    connexion = sqlite3.connect(chemin_bdd)
+    curseur = connexion.cursor()
+    curseur.execute(f"PRAGMA table_info({nom_table})")
+    infos = curseur.fetchall()
+    connexion.close()
+    return infos
 
-def get_column_names(u_path, table_name):
+def recuperer_noms_colonnes(chemin_bdd, nom_table):
+    """Retourne la liste des noms de colonnes d'une table."""
     try:
-        info = get_table_info(u_path, table_name)
-        return [col[1] for col in info]
+        infos = recuperer_infos_table(chemin_bdd, nom_table)
+        return [colonne[1] for colonne in infos]
     except Exception:
         return []
 
-def smart_average(row, start_index=3):
-    values = [v for v in row[start_index:] if v is not None and isinstance(v, (int, float))]
-    if not values:
+def moyenne_intelligente(ligne, index_depart=3):
+    """Calcule une moyenne sur les colonnes numériques d'une ligne."""
+    valeurs = [
+        valeur for valeur in ligne[index_depart:] if valeur is not None and isinstance(valeur, (int, float))
+    ]
+    if not valeurs:
         return 0.0
-    return sum(values) / len(values)
+    return sum(valeurs) / len(valeurs)
 
-def find_column(columns, candidates):
-    cols_lower = {c.lower(): c for c in columns}
-    for cand in candidates:
-        if cand.lower() in cols_lower:
-            return cols_lower[cand.lower()]
+def trouver_colonne(colonnes, candidats):
+    """Trouve une colonne par correspondance de nom."""
+    colonnes_minuscule = {colonne.lower(): colonne for colonne in colonnes}
+    for candidat in candidats:
+        if candidat.lower() in colonnes_minuscule:
+            return colonnes_minuscule[candidat.lower()]
     return None
 
-def find_name_column(columns):
-    for c in columns:
-        cl = c.lower()
-        if "objet" in cl or "nom" in cl or "name" in cl:
-            return c
-    return columns[1] if len(columns) > 1 else columns[0]
+def trouver_colonne_nom(colonnes):
+    """Trouve la colonne correspondant au nom d'objet."""
+    for colonne in colonnes:
+        colonne_minuscule = colonne.lower()
+        if "objet" in colonne_minuscule or "nom" in colonne_minuscule or "name" in colonne_minuscule:
+            return colonne
+    return colonnes[1] if len(colonnes) > 1 else colonnes[0]
 
-def find_type_column(columns):
-    for c in columns:
-        cl = c.lower()
-        if cl in ("type", "types"):
-            return c
+def trouver_colonne_type(colonnes):
+    """Trouve la colonne correspondant au type d'objet."""
+    for colonne in colonnes:
+        colonne_minuscule = colonne.lower()
+        if colonne_minuscule in ("type", "types"):
+            return colonne
     # parfois "Type_" etc
-    for c in columns:
-        if "type" in c.lower():
-            return c
+    for colonne in colonnes:
+        if "type" in colonne.lower():
+            return colonne
     return None
 
-def find_price_column(columns):
-    for c in columns:
-        cl = c.lower()
-        if "prix" in cl or "price" in cl:
-            return c
+def trouver_colonne_prix(colonnes):
+    """Trouve la colonne correspondant au prix."""
+    for colonne in colonnes:
+        colonne_minuscule = colonne.lower()
+        if "prix" in colonne_minuscule or "price" in colonne_minuscule:
+            return colonne
     return None
 
-def get_created_objects(universe_id):
-    u_path = universe_path(universe_id)
+def recuperer_objets_crees(identifiant_univers):
+    """Liste les objets créés dans un univers."""
+    chemin_bdd = chemin_univers(identifiant_univers)
     try:
-        columns = get_column_names(u_path, "stat_objects")
-        if not columns:
+        colonnes = recuperer_noms_colonnes(chemin_bdd, "stat_objects")
+        if not colonnes:
             return []
 
-        type_col = find_type_column(columns)
-        name_col = find_name_column(columns)
+        colonne_type = trouver_colonne_type(colonnes)
+        colonne_nom = trouver_colonne_nom(colonnes)
 
         # On recupere rowid pour supprimer proprement
-        conn = sqlite3.connect(u_path)
-        cur = conn.cursor()
+        connexion = sqlite3.connect(chemin_bdd)
+        curseur = connexion.cursor()
 
-        if type_col:
-            cur.execute(
+        if colonne_type:
+            curseur.execute(
                 f"""
                 SELECT rowid, *
                 FROM stat_objects
-                WHERE [{type_col}] IN ('Fusion', 'Moyenne ponderee', 'Moyenne pondérée')
+                WHERE [{colonne_type}] IN ('Fusion', 'Moyenne ponderee', 'Moyenne pondérée')
                 ORDER BY rowid DESC
                 """
             )
         else:
-            # fallback: liste tout
-            cur.execute("SELECT rowid, * FROM stat_objects ORDER BY rowid DESC")
+            # repli : liste tout
+            curseur.execute("SELECT rowid, * FROM stat_objects ORDER BY rowid DESC")
 
-        rows = cur.fetchall()
-        conn.close()
+        lignes = curseur.fetchall()
+        connexion.close()
 
-        price_col = find_price_column(columns)
-        # columns correspond a "*" (sans rowid)
-        # row schema: (rowid, col0, col1, col2, ...)
-        processed = []
-        for r in rows:
-            rid = r[0]
-            row = list(r[1:])  # les vraies colonnes
+        colonne_prix = trouver_colonne_prix(colonnes)
+        # Les colonnes correspondent à "*" (sans rowid)
+        # Schéma : (rowid, col0, col1, col2, ...)
+        objets_traites = []
+        for ligne in lignes:
+            identifiant = ligne[0]
+            donnees = list(ligne[1:])  # les vraies colonnes
 
-            # Trouver index name/type dans row
+            # Trouver l'index du nom et du type dans la ligne
             try:
-                name_idx = columns.index(name_col)
+                index_nom = colonnes.index(colonne_nom)
             except Exception:
-                name_idx = 0
+                index_nom = 0
             try:
-                type_idx = columns.index(type_col) if type_col else 2
+                index_type = colonnes.index(colonne_type) if colonne_type else 2
             except Exception:
-                type_idx = 2
+                index_type = 2
 
-            obj_name = row[name_idx] if name_idx < len(row) else "Sans nom"
-            obj_type = row[type_idx] if type_idx < len(row) else ""
+            nom_objet = donnees[index_nom] if index_nom < len(donnees) else "Sans nom"
+            type_objet = donnees[index_type] if index_type < len(donnees) else ""
 
             # moyenne auto sur les colonnes a partir de l index 3 (comme ton code)
-            avg_value = smart_average(row, start_index=3)
+            moyenne = moyenne_intelligente(donnees, index_depart=3)
 
-            display_price = None
-            if price_col:
+            prix_affichage = None
+            if colonne_prix:
                 try:
-                    price_idx = columns.index(price_col)
-                    val = row[price_idx] if price_idx < len(row) else None
-                    if isinstance(val, (int, float)):
-                        display_price = float(val)
+                    index_prix = colonnes.index(colonne_prix)
+                    valeur = donnees[index_prix] if index_prix < len(donnees) else None
+                    if isinstance(valeur, (int, float)):
+                        prix_affichage = float(valeur)
                 except Exception:
-                    display_price = None
+                    prix_affichage = None
 
-            if display_price is None:
-                display_price = float(avg_value)
+            if prix_affichage is None:
+                prix_affichage = float(moyenne)
 
-            processed.append((rid, obj_name, obj_type, display_price))
+            objets_traites.append((identifiant, nom_objet, type_objet, prix_affichage))
 
-        return processed
+        return objets_traites
 
     except Exception:
         return []
 
-def delete_object(universe_id, rowid_value):
-    u_path = universe_path(universe_id)
-    rowid_value = str(rowid_value).strip()
+def supprimer_objet(identifiant_univers, valeur_rowid):
+    """Supprime un objet créé dans un univers."""
+    chemin_bdd = chemin_univers(identifiant_univers)
+    valeur_rowid = str(valeur_rowid).strip()
     try:
-        rid = int(rowid_value)
+        identifiant = int(valeur_rowid)
     except Exception:
         return False
 
     try:
-        columns = get_column_names(u_path, "stat_objects")
-        if not columns:
+        colonnes = recuperer_noms_colonnes(chemin_bdd, "stat_objects")
+        if not colonnes:
             return False
 
-        name_col = find_name_column(columns)
+        colonne_nom = trouver_colonne_nom(colonnes)
 
-        conn = sqlite3.connect(u_path)
-        cur = conn.cursor()
+        connexion = sqlite3.connect(chemin_bdd)
+        curseur = connexion.cursor()
 
         # Recuperer le nom AVANT suppression (pour nettoyer liaison)
-        cur.execute(f"SELECT [{name_col}] FROM stat_objects WHERE rowid = ?", (rid,))
-        res = cur.fetchone()
-        if not res:
-            conn.close()
+        curseur.execute(f"SELECT [{colonne_nom}] FROM stat_objects WHERE rowid = ?", (identifiant,))
+        resultat = curseur.fetchone()
+        if not resultat:
+            connexion.close()
             return False
 
-        obj_name = res[0]
+        nom_objet = resultat[0]
 
         # Nettoyage liaison (si colonne existe)
-        liaison_col = None
-        for c in columns:
-            if c.lower() == "liaison":
-                liaison_col = c
+        colonne_liaison = None
+        for colonne in colonnes:
+            if colonne.lower() == "liaison":
+                colonne_liaison = colonne
                 break
 
-        if liaison_col:
+        if colonne_liaison:
             # Supporter plusieurs formats eventuels
-            candidates = [
-                f"lie a {obj_name}",
-                f"lié à {obj_name}",
-                f"lie a {str(obj_name)}",
-                f"lié à {str(obj_name)}",
+            candidats = [
+                f"lie a {nom_objet}",
+                f"lié à {nom_objet}",
+                f"lie a {str(nom_objet)}",
+                f"lié à {str(nom_objet)}",
             ]
-            cur.execute(
+            curseur.execute(
                 f"""
                 UPDATE stat_objects
-                SET [{liaison_col}] = 'null'
-                WHERE [{liaison_col}] IN ({",".join(["?"] * len(candidates))})
+                SET [{colonne_liaison}] = 'null'
+                WHERE [{colonne_liaison}] IN ({",".join(["?"] * len(candidats))})
                 """,
-                tuple(candidates),
+                tuple(candidats),
             )
 
         # Suppression par rowid (fiable)
-        cur.execute("DELETE FROM stat_objects WHERE rowid = ?", (rid,))
-        conn.commit()
-        conn.close()
+        curseur.execute("DELETE FROM stat_objects WHERE rowid = ?", (identifiant,))
+        connexion.commit()
+        connexion.close()
         return True
 
     except Exception:
         try:
-            conn.close()
+            connexion.close()
         except Exception:
             pass
         return False
 
 # --- Logique de l application ---
-universe_id = get_param("uid", "")
-action = get_param("action", "")
-object_id = get_param("object_id", "")
+identifiant_univers = recuperer_parametre("uid", "")
+action = recuperer_parametre("action", "")
+identifiant_objet = recuperer_parametre("object_id", "")
 
-msg, msg_class = "", ""
-if action == "delete" and object_id:
-    if delete_object(universe_id, object_id):
-        msg, msg_class = "Objet supprime avec succes !", "success"
+message, classe_message = "", ""
+if action == "delete" and identifiant_objet:
+    if supprimer_objet(identifiant_univers, identifiant_objet):
+        message, classe_message = "Objet supprime avec succes !", "success"
     else:
-        msg, msg_class = "Erreur lors de la suppression.", "error"
+        message, classe_message = "Erreur lors de la suppression.", "error"
 
-universe_name = get_universe_name(universe_id)
-created_objects = get_created_objects(universe_id)
+nom_univers = recuperer_nom_univers(identifiant_univers)
+objets_crees = recuperer_objets_crees(identifiant_univers)
 
 # --- Sortie HTML ---
-def esc(s):
-    return html.escape("" if s is None else str(s))
+def echapper_html(texte):
+    """Échappe le texte pour un affichage HTML sûr."""
+    return html.escape("" if texte is None else str(texte))
 
-html_output = f"""<!DOCTYPE html>
+sortie_html = f"""<!DOCTYPE html>
 <html lang="fr">
 <head>
     <meta charset="utf-8">
-    <title>Liste des Objets - {esc(universe_name)}</title>
+    <title>Liste des Objets - {echapper_html(nom_univers)}</title>
     <style>
         body {{ margin: 0; font-family: sans-serif; color: white; background: url('/create_stat_object.png') center/cover fixed; }}
         .panel {{ width: 850px; margin: 50px auto; background: url('/fond_filtre_pannel.png') no-repeat center/100% 100%; padding: 40px; min-height: 500px; }}
@@ -264,26 +281,26 @@ html_output = f"""<!DOCTYPE html>
     </style>
 </head>
 <body>
-    <a href="/cgi-bin/personnalisation_objet.py?uid={esc(universe_id)}" class="back-btn">←</a>
+    <a href="/cgi-bin/personnalisation_objet.py?uid={echapper_html(identifiant_univers)}" class="back-btn">←</a>
     <div class="panel">
-        <h1>Objets crees : {esc(universe_name)}</h1>
-        {f'<div class="message {esc(msg_class)}">{esc(msg)}</div>' if msg else ''}
+        <h1>Objets crees : {echapper_html(nom_univers)}</h1>
+        {f'<div class="message {echapper_html(classe_message)}">{echapper_html(message)}</div>' if message else ''}
 
         <div class="list">
-            {"<p style='text-align:center'>Aucun objet dans cet univers.</p>" if not created_objects else ""}
+            {"<p style='text-align:center'>Aucun objet dans cet univers.</p>" if not objets_crees else ""}
             {''.join([f'''
             <div class="object-item">
                 <div>
-                    <div class="obj-title">{esc(obj[1])}</div>
-                    <div class="obj-type">Type : {esc(obj[2])}</div>
+                    <div class="obj-title">{echapper_html(obj[1])}</div>
+                    <div class="obj-type">Type : {echapper_html(obj[2])}</div>
                     <div class="obj-val">Valeur : {float(obj[3]):.2f} <span class="auto-info">Moyenne Auto</span></div>
                 </div>
-                <a href="?uid={esc(universe_id)}&action=delete&object_id={urllib.parse.quote(str(obj[0]))}" class="delete-btn" onclick="return confirm('Supprimer cet objet ?')">Supprimer</a>
+                <a href="?uid={echapper_html(identifiant_univers)}&action=delete&object_id={urllib.parse.quote(str(obj[0]))}" class="delete-btn" onclick="return confirm('Supprimer cet objet ?')">Supprimer</a>
             </div>
-            ''' for obj in created_objects])}
+            ''' for obj in objets_crees])}
         </div>
     </div>
 </body>
 </html>"""
 
-print(html_output)
+print(sortie_html)

@@ -6,29 +6,43 @@ import html
 
 print("Content-type: text/html; charset=utf-8\n")
 
-DB_PATH = "cgi-bin/objets.db"
+# Chemin de la base de données principale
+CHEMIN_BDD = "cgi-bin/objets.db"
 
-def esc(s):
-    return html.escape("" if s is None else str(s))
+def echapper_html(texte):
+    """Échappe le texte pour un affichage HTML sûr."""
+    return html.escape("" if texte is None else str(texte))
 
-def distinct(col):
+def valeurs_distinctes(colonne):
+    """Retourne les valeurs distinctes d'une colonne de la table Prix_Objets."""
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute(f"SELECT DISTINCT {col} FROM Prix_Objets WHERE {col} IS NOT NULL AND TRIM({col}) != '' ORDER BY {col} COLLATE NOCASE")
-        vals = [r[0] for r in cur.fetchall()]
-        conn.close()
-        return vals
-    except:
+        connexion = sqlite3.connect(CHEMIN_BDD)
+        curseur = connexion.cursor()
+        curseur.execute(
+            f"SELECT DISTINCT {colonne} FROM Prix_Objets "
+            f"WHERE {colonne} IS NOT NULL AND TRIM({colonne}) != '' "
+            f"ORDER BY {colonne} COLLATE NOCASE"
+        )
+        valeurs = [ligne[0] for ligne in curseur.fetchall()]
+        connexion.close()
+        return valeurs
+    except Exception:
         return []
 
-familles = distinct("Famille")
-types = distinct("Type")
-speculations = distinct("Speculation")
+# Chargement des valeurs pour les listes déroulantes
+familles = valeurs_distinctes("Famille")
+types_objet = valeurs_distinctes("Type")
+speculations = valeurs_distinctes("Speculation")
 
-famille_opts = "\n".join([f'<option value="{esc(v)}">{esc(v)}</option>' for v in familles])
-type_opts = "\n".join([f'<option value="{esc(v)}">{esc(v)}</option>' for v in types])
-specu_opts = "\n".join([f'<option value="{esc(v)}">{esc(v)}</option>' for v in speculations])
+options_famille = "\n".join(
+    [f'<option value="{echapper_html(valeur)}">{echapper_html(valeur)}</option>' for valeur in familles]
+)
+options_type = "\n".join(
+    [f'<option value="{echapper_html(valeur)}">{echapper_html(valeur)}</option>' for valeur in types_objet]
+)
+options_speculation = "\n".join(
+    [f'<option value="{echapper_html(valeur)}">{echapper_html(valeur)}</option>' for valeur in speculations]
+)
 
 print(f"""
 <!DOCTYPE html>
@@ -354,19 +368,19 @@ input[type="text"]::placeholder {{
                 <label>Famille</label>
                 <select name="famille">
                     <option value="">Toutes</option>
-                    {famille_opts}
+                    {options_famille}
                 </select>
 
                 <label>Type</label>
                 <select name="type">
                     <option value="">Tous</option>
-                    {type_opts}
+                    {options_type}
                 </select>
 
                 <label>Spéculation</label>
                 <select name="speculation">
                     <option value="">Toutes</option>
-                    {specu_opts}
+                    {options_speculation}
                 </select>
 
                 <label>Prix moyen max</label>
